@@ -1,0 +1,31 @@
+name: Go
+
+on:
+  push:
+  pull_request:
+
+env:
+  GOLANGCI_LINT_VERSION: v1.56.2
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v4
+      with:
+        skip-cache: true
+        version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+    - name: Test
+      run: go test -v ./...
