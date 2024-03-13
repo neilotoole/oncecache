@@ -1,12 +1,9 @@
 module github.com/neilotoole/oncecache
 
-go 1.22
-
-toolchain go1.22.1
+go 1.21
 
 require (
 	github.com/neilotoole/slogt v1.1.0
-	github.com/neilotoole/sq v0.48.3
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/exp v0.0.0-20240222234643-814bf88cf225
 )

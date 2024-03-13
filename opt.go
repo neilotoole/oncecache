@@ -8,8 +8,8 @@ type Opt interface {
 }
 
 // optApplier is an [Opt] that uses the apply method to configure the fields of
-// [Cache]. It must be type-parameterized, as this Opt access the parameterized
-// fields of [Cache].
+// [Cache]. It must be type-parameterized, as this Opt accesses the
+// parameterized fields of [Cache].
 type optApplier[K comparable, V any] interface {
 	Opt
 	apply(c *Cache[K, V])

@@ -6,8 +6,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/neilotoole/slogt"
 	"github.com/stretchr/testify/require"
+
+	"github.com/neilotoole/slogt"
 
 	"github.com/neilotoole/oncecache/examples/hrsystem"
 )
