@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -582,4 +583,74 @@ func newBufLogger() (*bytes.Buffer, *slog.Logger) {
 		},
 	})
 	return buf, slog.New(h)
+}
+
+//nolint:revive
+func ExampleCache_Keys() {
+	// Ignore error handling for brevity.
+	ctx := context.Background()
+	c := oncecache.New[int, int](calcFibonacci)
+
+	for key := 4; key < 7; key++ {
+		val, _ := c.Get(ctx, key) // Prime the cache for keys 4, 5, 6
+		fmt.Println(key, val)
+	}
+
+	keys := c.Keys() // Keys returns indeterminate order
+	slices.Sort(keys)
+	fmt.Println("Keys in cache:", keys)
+	fmt.Println("Num entries:", c.Len())
+	fmt.Println("Has key 2?", c.Has(2))
+
+	c.Delete(ctx, 5)
+	keys = c.Keys()
+	slices.Sort(keys)
+	fmt.Println("Keys in cache after Delete(5):", keys)
+
+	// MaybeSet sets the value if the key is not already in the cache.
+	didSet := c.MaybeSet(ctx, 4, 3, nil) // No-op: 4 already in cache
+	fmt.Println("Did set 4?", didSet)
+	didSet = c.MaybeSet(ctx, 7, 13, nil) // Cache write: 7 not in cache
+	fmt.Println("Did set 7?", didSet)
+
+	c.Clear(ctx) // Clear empties c, but it's still usable
+	fmt.Println("Keys after cache clear:", c.Keys())
+
+	// Close clears c and releases resources. Afterwards, c is unusable,
+	// and operations on it may return an error.
+	_ = c.Close()
+
+	// Output:
+	// 4 3
+	// 5 5
+	// 6 8
+	// Keys in cache: [4 5 6]
+	// Num entries: 3
+	// Has key 2? false
+	// Keys in cache after Delete(5): [4 6]
+	// Did set 4? false
+	// Did set 7? true
+	// Keys after cache clear: []
+}
+
+//nolint:revive
+func ExampleCache_Get() {
+	// Ignore error handling for brevity.
+	ctx := context.Background()
+	c := oncecache.New[int, int](calcFibonacci)
+
+	key := 6
+	val, _ := c.Get(ctx, key) // Cache MISS - calcFibonacci is invoked
+	fmt.Println(key, val)
+	val, _ = c.Get(ctx, key) // Cache HIT
+	fmt.Println(key, val)
+
+	key = 9
+	val, _ = c.Get(ctx, key) // Cache MISS - calcFibonacci is invoked
+	fmt.Println(key, val)
+
+	// Output:
+	// 6 8
+	// 6 8
+	// 9 34
 }
