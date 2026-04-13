@@ -1627,9 +1627,10 @@ func TestStress(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(goroutines)
 	for g := 0; g < goroutines; g++ {
+		seed := int64(g)
 		go func() {
 			defer wg.Done()
-			rng := rand.New(rand.NewSource(int64(g)))
+			rng := rand.New(rand.NewSource(seed))
 			ctx := context.Background()
 			for i := 0; i < opsPerGoroutine; i++ {
 				key := rng.Intn(keyspace)
