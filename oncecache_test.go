@@ -758,7 +758,7 @@ func TestOnMiss(t *testing.T) {
 	var mu sync.Mutex
 	c := oncecache.New[int, int](
 		fetchDouble,
-		oncecache.OnMiss[int, int](func(_ context.Context, k int) {
+		oncecache.OnMiss(func(_ context.Context, k int, _ int, _ error) {
 			mu.Lock()
 			missKeys = append(missKeys, k)
 			mu.Unlock()
@@ -837,12 +837,11 @@ func TestClear_Empty(t *testing.T) {
 	require.Equal(t, 0, c.Len())
 }
 
-// TestFetchPanic documents the current behavior when the fetch function
-// panics. The panic propagates to the Get caller; [sync.Once] records the
-// call as done, so the entry is permanently cached as the zero value with
-// nil error and fetch is not reinvoked. OpMiss fires but OpFill does not —
-// which violates the "OpMiss is always immediately followed by OpFill" doc
-// invariant. See oncecache review item #3.
+// TestFetchPanic verifies that a panicking fetch is recovered into a
+// wrapped [oncecache.ErrPanic] error stored on the entry, that the
+// triggering Get returns that wrapped error rather than propagating the
+// panic, and that subsequent Gets return the same error without
+// reinvoking fetch. The OnMiss → OnFill lifecycle invariant is preserved.
 func TestFetchPanic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -853,7 +852,7 @@ func TestFetchPanic(t *testing.T) {
 			fetchCalls.Add(1)
 			panic("boom")
 		},
-		oncecache.OnMiss[int, int](func(_ context.Context, _ int) {
+		oncecache.OnMiss(func(_ context.Context, _ int, _ int, _ error) {
 			missCalls.Add(1)
 		}),
 		oncecache.OnFill(func(_ context.Context, _, _ int, _ error) {
@@ -861,20 +860,19 @@ func TestFetchPanic(t *testing.T) {
 		}),
 	)
 
-	func() {
-		defer func() {
-			require.Equal(t, "boom", recover())
-		}()
-		_, _ = c.Get(ctx, 1)
-	}()
-	require.Equal(t, int64(1), fetchCalls.Load())
-	require.Equal(t, int64(1), missCalls.Load())
-	require.Equal(t, int64(0), fillCalls.Load()) // doc invariant violated
-
-	// Subsequent Get does not re-invoke fetch and returns (zero, nil).
 	v, err := c.Get(ctx, 1)
 	require.Zero(t, v)
-	require.NoError(t, err)
+	require.Error(t, err)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+	require.Contains(t, err.Error(), "boom")
+	require.Equal(t, int64(1), fetchCalls.Load())
+	require.Equal(t, int64(1), missCalls.Load())
+	require.Equal(t, int64(1), fillCalls.Load(), "OpFill must follow OpMiss even on panic")
+
+	// Subsequent Get returns the same wrapped error without reinvoking fetch.
+	v, err = c.Get(ctx, 1)
+	require.Zero(t, v)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
 	require.Equal(t, int64(1), fetchCalls.Load())
 }
 
@@ -1044,6 +1042,172 @@ func TestOnEvent_Blocking(t *testing.T) {
 	_, _ = c.Get(ctx, 2)
 	_, _ = c.Get(ctx, 3)
 	require.Equal(t, 3, len(ch))
+}
+
+// TestOnEvent_BlockingCancellation verifies that a blocking OnEvent send
+// aborts when the triggering context is cancelled, so a stalled consumer
+// cannot hang the producer indefinitely.
+func TestOnEvent_BlockingCancellation(t *testing.T) {
+	t.Parallel()
+
+	ch := make(chan oncecache.Event[int, int]) // unbuffered, no receiver
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvent(ch, true, oncecache.OpFill),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+	// Without ctx-cancellation in the OnEvent send path, this would hang.
+	done := make(chan struct{})
+	go func() {
+		_, _ = c.Get(ctx, 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Get hung; OnEvent blocking send did not honor ctx cancellation")
+	}
+}
+
+// TestEvent_Ctx verifies that delivered Events carry the triggering ctx,
+// and that FromContext on Event.Ctx yields the source cache.
+func TestEvent_Ctx(t *testing.T) {
+	t.Parallel()
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+
+	ch := make(chan oncecache.Event[int, int], 1)
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvent(ch, false, oncecache.OpFill),
+	)
+
+	_, _ = c.Get(ctx, 1)
+
+	var ev oncecache.Event[int, int]
+	select {
+	case ev = <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("no event received")
+	}
+	require.NotNil(t, ev.Ctx)
+	require.Equal(t, "marker", ev.Ctx.Value(ctxKey{}))
+	// Event.Ctx is decorated with the source cache.
+	require.Equal(t, c, oncecache.FromContext[int, int](ev.Ctx))
+}
+
+// TestConcurrentCloseAndGet verifies that Close races safely against Get.
+// With Close simplified to just clear entries (not detach callbacks), the
+// race detector should stay quiet.
+func TestConcurrentCloseAndGet(t *testing.T) {
+	t.Parallel()
+
+	const iters = 1000
+	c := oncecache.New[int, int](fetchDouble)
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_, _ = c.Get(context.Background(), i)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters/10; i++ {
+			_ = c.Close()
+		}
+	}()
+	wg.Wait()
+}
+
+// TestGobDecode_Corrupted verifies that GobDecode returns an error for
+// malformed input and leaves the cache in a usable state.
+func TestGobDecode_Corrupted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := oncecache.New[int, int](fetchDouble, oncecache.Name("orig"))
+
+	require.Error(t, c.GobDecode([]byte("not gob data at all")))
+	require.Error(t, c.GobDecode(nil))
+	require.Error(t, c.GobDecode([]byte{}))
+
+	// Cache survives the corrupt-decode attempts.
+	v, err := c.Get(ctx, 5)
+	require.NoError(t, err)
+	require.Equal(t, 10, v)
+	require.Equal(t, "orig", c.Name())
+}
+
+// TestCallback_RegistrationOrder verifies that when multiple callbacks of
+// the same op are registered, they fire in the order they were registered.
+func TestCallback_RegistrationOrder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var order []int
+	var mu sync.Mutex
+	mark := func(n int) func(context.Context, int, int, error) {
+		return func(_ context.Context, _, _ int, _ error) {
+			mu.Lock()
+			order = append(order, n)
+			mu.Unlock()
+		}
+	}
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnFill(mark(1)),
+		oncecache.OnFill(mark(2)),
+		oncecache.OnFill(mark(3)),
+	)
+	_, _ = c.Get(ctx, 42)
+	require.Equal(t, []int{1, 2, 3}, order)
+}
+
+// TestDelete_Reentry verifies that an OnEvict callback may safely call
+// methods on the same cache (Get, Has, Len, Keys, even Delete on a
+// different key) without deadlocking. This is the snapshot-then-callback
+// guarantee added in the Delete/Clear concurrency fix.
+func TestDelete_Reentry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var c *oncecache.Cache[int, int]
+	c = oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvict(func(_ context.Context, k int, _ int, _ error) {
+			// Touch the cache from inside the eviction callback. With the
+			// pre-fix code that held c.mu across callbacks, all of these
+			// would deadlock.
+			_ = c.Has(k)
+			_ = c.Len()
+			_ = c.Keys()
+			if k == 1 {
+				c.Delete(ctx, 99) // a different (absent) key
+			}
+		}),
+	)
+	_, _ = c.Get(ctx, 1)
+	c.Delete(ctx, 1)
+}
+
+// TestClear_Reentry verifies that an OnEvict callback fired by Clear may
+// safely call methods on the same cache without deadlocking.
+func TestClear_Reentry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var c *oncecache.Cache[int, int]
+	c = oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) {
+			_ = c.Has(0)
+			_ = c.Len()
+		}),
+	)
+	_, _ = c.Get(ctx, 1)
+	_, _ = c.Get(ctx, 2)
+	c.Clear(ctx)
 }
 
 // BenchmarkGet_Hit measures a single-goroutine steady-state cache hit.

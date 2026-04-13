@@ -134,40 +134,42 @@ func (o *logOpt[K, V]) apply(c *Cache[K, V]) {
 	}
 }
 
-func (o *logOpt[K, V]) logEvent(ev Event[K, V]) {
-	o.log.LogAttrs(context.Background(), o.lvl.Level(), LogConfig.Msg, slog.Any(LogConfig.AttrEvent, ev))
+// logEvent emits a slog record for ev under ctx. The forwarded ctx
+// preserves trace/span attribution from the triggering Cache call.
+func (o *logOpt[K, V]) logEvent(ctx context.Context, ev Event[K, V]) {
+	o.log.LogAttrs(ctx, o.lvl.Level(), LogConfig.Msg, slog.Any(LogConfig.AttrEvent, ev))
 }
 
 func (o *logOpt[K, V]) logHit(ctx context.Context, key K, val V, err error) {
-	ev := Event[K, V]{
+	o.logEvent(ctx, Event[K, V]{
 		Op:    OpHit,
+		Ctx:   ctx,
 		Entry: Entry[K, V]{Cache: FromContext[K, V](ctx), Key: key, Val: val, Err: err},
-	}
-	o.logEvent(ev)
+	})
 }
 
 func (o *logOpt[K, V]) logMiss(ctx context.Context, key K, val V, err error) {
-	ev := Event[K, V]{
+	o.logEvent(ctx, Event[K, V]{
 		Op:    OpMiss,
+		Ctx:   ctx,
 		Entry: Entry[K, V]{Cache: FromContext[K, V](ctx), Key: key, Val: val, Err: err},
-	}
-	o.logEvent(ev)
+	})
 }
 
 func (o *logOpt[K, V]) logFill(ctx context.Context, key K, val V, err error) {
-	ev := Event[K, V]{
+	o.logEvent(ctx, Event[K, V]{
 		Op:    OpFill,
+		Ctx:   ctx,
 		Entry: Entry[K, V]{Cache: FromContext[K, V](ctx), Key: key, Val: val, Err: err},
-	}
-	o.logEvent(ev)
+	})
 }
 
 func (o *logOpt[K, V]) logEvict(ctx context.Context, key K, val V, err error) {
-	ev := Event[K, V]{
+	o.logEvent(ctx, Event[K, V]{
 		Op:    OpEvict,
+		Ctx:   ctx,
 		Entry: Entry[K, V]{Cache: FromContext[K, V](ctx), Key: key, Val: val, Err: err},
-	}
-	o.logEvent(ev)
+	})
 }
 
 // LogValue implements [slog.LogValuer] for [Event]. The emitted group
@@ -177,7 +179,7 @@ func (o *logOpt[K, V]) logEvict(ctx context.Context, key K, val V, err error) {
 // from [LogConfig].
 func (e Event[K, V]) LogValue() slog.Value {
 	attrs := make([]slog.Attr, 3, 5)
-	attrs[0] = slog.String(LogConfig.AttrCache, e.Cache.name)
+	attrs[0] = slog.String(LogConfig.AttrCache, e.Cache.Name())
 	attrs[1] = slog.String(LogConfig.AttrOp, e.Op.String())
 	attrs[2] = slog.Any(LogConfig.AttrKey, e.Key)
 
@@ -199,7 +201,7 @@ func (e Event[K, V]) LogValue() slog.Value {
 // may not be printable; for structured output, use [Event.LogValue].
 func (e Event[K, V]) String() string {
 	var sb strings.Builder
-	sb.WriteString(e.Cache.name)
+	sb.WriteString(e.Cache.Name())
 	sb.WriteRune('.')
 	sb.WriteString(e.Op.String())
 	sb.WriteRune('[')
@@ -219,7 +221,7 @@ func (e Event[K, V]) String() string {
 // be printable; for structured output, use [Entry.LogValue].
 func (e Entry[K, V]) String() string {
 	sb := strings.Builder{}
-	sb.WriteString(e.Cache.name)
+	sb.WriteString(e.Cache.Name())
 	sb.WriteRune('[')
 	sb.WriteString(fmt.Sprintf("%v", e.Key))
 	sb.WriteRune(']')
@@ -240,7 +242,7 @@ func (e Entry[K, V]) String() string {
 // payload. Attribute names come from [LogConfig].
 func (e Entry[K, V]) LogValue() slog.Value {
 	attrs := make([]slog.Attr, 2, 4)
-	attrs[0] = slog.String(LogConfig.AttrCache, e.Cache.name)
+	attrs[0] = slog.String(LogConfig.AttrCache, e.Cache.Name())
 	attrs[1] = slog.Any(LogConfig.AttrKey, e.Key)
 
 	if e.isValLogged() {

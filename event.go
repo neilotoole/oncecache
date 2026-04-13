@@ -38,10 +38,18 @@ type Entry[K comparable, V any] struct {
 }
 
 // Event is a notification of a cache operation, as delivered to [OnEvent]
-// channels. It extends [Entry] with the operation kind ([Op]).
+// channels. It extends [Entry] with the operation kind ([Op]) and the
+// triggering context.
 type Event[K comparable, V any] struct {
 	// Entry carries the affected (Cache, Key, Val, Err).
 	Entry[K, V]
+
+	// Ctx is the context of the [Cache] operation that produced the
+	// event, decorated with the source [Cache] (retrievable via
+	// [FromContext]). Consumers may use Ctx for trace propagation or to
+	// observe cancellation of the producing goroutine. Always non-nil
+	// for events produced by this package.
+	Ctx context.Context
 
 	// Op identifies the operation that triggered the event: one of
 	// [OpHit], [OpMiss], [OpFill], or [OpEvict].
@@ -56,34 +64,34 @@ type Event[K comparable, V any] struct {
 // The block parameter controls backpressure behavior when ch is full:
 //   - block=true: the [Cache] operation that produced the event blocks on
 //     the send. Use with an unbuffered (or small-buffered) ch to prevent
-//     the consumer from falling behind the cache.
+//     the consumer from falling behind the cache. The send aborts if the
+//     triggering ctx is cancelled, dropping the event.
 //   - block=false: the event is dropped if ch cannot receive immediately.
 //     Use with a buffered ch when event loss under backpressure is
 //     acceptable.
 //
-// Caveats:
-//   - OnEvent does not forward the triggering ctx on the event; the event
-//     consumer cannot honor cancellation of the producing goroutine.
-//   - With block=true, if the consumer goroutine dies, the triggering
-//     [Cache] method hangs indefinitely.
-//   - The caller owns ch. OnEvent never closes ch.
+// Each delivered [Event] carries the triggering context as [Event.Ctx],
+// so consumers can extract the source [Cache] via [FromContext], honor
+// cancellation, or propagate trace state.
 //
-// Related: for long-running work, OnEvent with a buffered channel is
-// usually better than the synchronous [OnFill]/[OnEvict]/[OnHit]/[OnMiss]
-// callbacks. For basic logging, see [Log].
+// The caller owns ch. OnEvent never closes ch.
+//
+// For long-running work, OnEvent with a buffered channel is usually better
+// than the synchronous [OnFill]/[OnEvict]/[OnHit]/[OnMiss] callbacks. For
+// basic logging, see [Log].
 func OnEvent[K comparable, V any](ch chan<- Event[K, V], block bool, ops ...Op) Opt {
 	ops = uniq(ops)
 	if len(ops) == 0 {
-		ops = []Op{OpFill, OpEvict, OpHit, OpMiss}
+		ops = []Op{OpHit, OpMiss, OpFill, OpEvict}
 	}
-
-	return eventOpt[K, V]{ch: ch, block: block, ops: uniq(ops)}
+	return eventOpt[K, V]{ch: ch, block: block, ops: ops}
 }
 
 // eventOpt is the [Opt] returned by [OnEvent]. It carries the destination
 // channel, the set of ops to deliver, and the block/drop mode. Its apply
 // method installs a synthetic callback for each op that packages a
-// callback invocation into an [Event] and sends it (blocking or not).
+// callback invocation into an [Event] and sends it (blocking, with ctx
+// cancellation, or non-blocking with drop).
 type eventOpt[K comparable, V any] struct {
 	ch    chan<- Event[K, V]
 	ops   []Op
@@ -94,20 +102,24 @@ func (o eventOpt[K, V]) optioner() {}
 
 func (o eventOpt[K, V]) apply(c *Cache[K, V]) { //nolint:unused // linter is wrong, method is invoked.
 	for _, op := range o.ops {
-		op := op
-		fn := func(_ context.Context, key K, val V, err error) {
+		fn := func(ctx context.Context, key K, val V, err error) {
 			event := Event[K, V]{
 				Op:    op,
+				Ctx:   ctx,
 				Entry: Entry[K, V]{Cache: c, Key: key, Val: val, Err: err},
 			}
 
 			if o.block {
-				// Blocking.
-				o.ch <- event
+				// Blocking, with ctx cancellation so a dead consumer
+				// doesn't hang the producer indefinitely.
+				select {
+				case o.ch <- event:
+				case <-ctx.Done():
+				}
 				return
 			}
 
-			// Non-blocking.
+			// Non-blocking: drop on full.
 			select {
 			case o.ch <- event:
 			default:
@@ -124,8 +136,7 @@ func (o eventOpt[K, V]) apply(c *Cache[K, V]) { //nolint:unused // linter is wro
 		case OpMiss:
 			c.onMiss = append(c.onMiss, fn)
 		default:
-			// Shouldn't happen.
-			panic(fmt.Sprintf("unknown action: %v: %s", op, op))
+			panic(fmt.Sprintf("unknown op: %v: %s", op, op))
 		}
 	}
 }
@@ -208,21 +219,22 @@ func OnHit[K comparable, V any](fn func(ctx context.Context, key K, val V, err e
 
 // OnMiss returns an [Opt] for [New] that registers fn as a synchronous
 // callback invoked when [Cache.Get] observes a cache miss, before fetch
-// runs. OnMiss fires only once per entry lifetime; it is always followed
-// by a successful [OpFill] (unless fetch panics, in which case [OpFill]
-// does not fire — see [FetchFunc]).
+// runs. OnMiss fires only once per entry lifetime; it is followed by an
+// [OpFill] (with either the fetch result or a panic-wrapped error — see
+// [FetchFunc]).
 //
-// The fn signature intentionally omits val and err because neither is
-// defined yet at miss time. OnMiss callbacks run synchronously; the
-// triggering [Cache.Get] blocks until they return. Prefer [OnEvent] for
-// long-running work.
+// The val and err arguments to fn are always the zero values, since the
+// entry has not yet been populated at miss time; they exist solely so that
+// OnMiss shares the standard callback signature with [OnFill], [OnHit],
+// and [OnEvict] (and so the V type parameter is inferable from fn).
+//
+// OnMiss callbacks run synchronously; the triggering [Cache.Get] blocks
+// until they return. Prefer [OnEvent] for long-running work.
 //
 // OnMiss is not emitted by [Cache.MaybeSet], since MaybeSet is not a
 // [Cache.Get] miss path.
-func OnMiss[K comparable, V any](fn func(ctx context.Context, key K)) Opt {
-	return callbackOpt[K, V]{op: OpMiss, fn: func(ctx context.Context, key K, _ V, _ error) {
-		fn(ctx, key)
-	}}
+func OnMiss[K comparable, V any](fn func(ctx context.Context, key K, val V, err error)) Opt {
+	return callbackOpt[K, V]{op: OpMiss, fn: fn}
 }
 
 // Op is an enumeration of cache operations. It is the kind field of [Event]

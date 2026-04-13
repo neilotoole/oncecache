@@ -80,7 +80,7 @@ func calcFibonacci(ctx context.Context, n int) (val int, err error) {
 [`Keys`](https://pkg.go.dev/github.com/neilotoole/oncecache#Cache.Keys), etc.
 
 ```go
-func ExampleOperations() {
+func ExampleCache_Keys() {
 	// Ignore error handling for brevity.
 	ctx := context.Background()
 	c := oncecache.New[int, int](calcFibonacci)
