@@ -40,10 +40,14 @@
 // runs fetch and subsequent callers block until the fetch completes, then all
 // receive the same result.
 //
-// Synchronous callbacks run on the goroutine that triggered the event. They
-// must not touch the same cache for the same key (that re-enters the entry's
-// [sync.Once] and deadlocks). For long-running callbacks, prefer [OnEvent]
-// with a buffered channel.
+// Synchronous callbacks run on the goroutine that triggered the event.
+// [OnFill], [OnMiss], and [OnHit] callbacks must not call [Cache.Get] or
+// [Cache.MaybeSet] for the same key on the same cache — that re-enters
+// the entry's [sync.Once] and deadlocks — but they may freely act on
+// other keys or other caches (the foundation of composite-cache
+// propagation). [OnEvict] has no such restriction: it runs after the
+// cache's internal lock is released and may call any method on any
+// cache. For long-running work, prefer [OnEvent] with a buffered channel.
 package oncecache
 
 import (

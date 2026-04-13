@@ -107,11 +107,12 @@ func ExampleCache_Keys() {
 	didSet = c.MaybeSet(ctx, 7, 13, nil) // Cache write: 7 not in cache
 	fmt.Println("Did set 7?", didSet)
 
-	c.Clear(ctx) // Clear empties c, but it's still usable
+	c.Clear(ctx) // Clear empties c, firing any OnEvict callbacks.
 	fmt.Println("Keys after cache clear:", c.Keys())
 
-	// Close clears c and releases resources. Afterwards, c is unusable,
-	// and operations on it may return an error.
+	// Close empties the cache without firing OnEvict. Callbacks are
+	// retained and the cache remains fully usable for later Get /
+	// MaybeSet / Delete calls.
 	_ = c.Close()
 
 	// Output:
@@ -128,6 +129,20 @@ func ExampleCache_Keys() {
 }
 ```
 
+### Errors and panics
+
+An error returned by the fetch function is cached alongside the value: the
+entry `(key, zero-value, err)` is still a fully-populated entry, and a
+subsequent `Get` for the same key returns that same error without reinvoking
+fetch, until the entry is explicitly evicted.
+
+If the fetch function **panics**, `oncecache` recovers the panic and stores it
+as an error wrapping the exported
+[`ErrPanic`](https://pkg.go.dev/github.com/neilotoole/oncecache#ErrPanic)
+sentinel. `Get` returns that wrapped error — the panic is *not* propagated
+to the caller. `OnFill` callbacks fire normally with the wrapped error.
+Detect the case with `errors.Is(err, oncecache.ErrPanic)`.
+
 ### Callbacks
 
 When constructing a cache, you can provide callback functions that are invoked
@@ -138,6 +153,7 @@ Here's an example that logs cache events:
 
 ```go
 func main() {
+	ctx := context.Background()
 	log := slog.Default()
 	c := oncecache.New[int, int](
 		calcFibonacci,
@@ -166,10 +182,20 @@ you can use one of the (synchronous) [`OnHit`](https://pkg.go.dev/github.com/nei
 [`OnFill`](https://pkg.go.dev/github.com/neilotoole/oncecache#OnFill)
 or [`OnEvict`](https://pkg.go.dev/github.com/neilotoole/oncecache#OnEvict)
 handlers, or the more generic [`OnEvent`](https://pkg.go.dev/github.com/neilotoole/oncecache#OnEvent) handler,
-which receives cache events on a channel.
+which receives cache events on a channel. Each delivered
+[`Event`](https://pkg.go.dev/github.com/neilotoole/oncecache#Event) carries
+the triggering context as `Event.Ctx`, so async consumers can observe
+cancellation or propagate trace state.
+
+The synchronous callbacks may freely act on other keys or other caches —
+the foundation of the composite-cache propagation pattern shown below. The
+one restriction is that `OnFill` / `OnMiss` / `OnHit` must not call `Get`
+or `MaybeSet` for the *same key on the same cache* (that re-enters the
+entry's internal `sync.Once` and deadlocks). `OnEvict` has no such
+restriction.
 
 See `TestCallbacks` or `TestOnEventChan` in [`oncecache_test.go`](./oncecache_test.go) for
-more details, or the take a look at the [`hrsystem` example](./examples/hrsystem/README.md).
+more details, or take a look at the [`hrsystem` example](./examples/hrsystem/README.md).
 
 ## Cache composition & propagation
 
@@ -306,4 +332,4 @@ func (c *HRCache) onFillDept(ctx context.Context, _ string, dept *Department, er
 
 - `oncecache` was developed for use by [`sq`](https://sq.io), which uses `oncecache`
   to cache database metadata, e.g. the entire metadata of a database schema, or individual tables
-  withing that schema. See it in use [here](https://github.com/neilotoole/sq/blob/e86d01fdb756a212c59edd3bd6cbd5a5a1b3056d/libsq/source/mdcache/mdcache.go#L22).
+  within that schema. See it in use [here](https://github.com/neilotoole/sq/blob/e86d01fdb756a212c59edd3bd6cbd5a5a1b3056d/libsq/source/mdcache/mdcache.go#L22).

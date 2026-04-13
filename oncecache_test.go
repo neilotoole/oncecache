@@ -1935,11 +1935,12 @@ func ExampleCache_Keys() {
 	didSet = c.MaybeSet(ctx, 7, 13, nil) // Cache write: 7 not in cache
 	fmt.Println("Did set 7?", didSet)
 
-	c.Clear(ctx) // Clear empties c, but it's still usable
+	c.Clear(ctx) // Clear empties c, firing any OnEvict callbacks.
 	fmt.Println("Keys after cache clear:", c.Keys())
 
-	// Close clears c and releases resources. Afterwards, c is unusable,
-	// and operations on it may return an error.
+	// Close empties the cache without firing OnEvict. Callbacks are
+	// retained and the cache remains fully usable for later Get /
+	// MaybeSet / Delete calls.
 	_ = c.Close()
 
 	// Output:
