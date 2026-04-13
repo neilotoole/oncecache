@@ -497,6 +497,7 @@ type gobEntry[K comparable, V any] struct {
 // encoded. The fetch func and callbacks are not encoded. Entries whose fill is
 // still in-flight are omitted from the encoded output.
 func (c *Cache[K, V]) GobEncode() ([]byte, error) {
+	registerFillPanicErrorOnGob()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -544,6 +545,7 @@ func (c *Cache[K, V]) GobEncode() ([]byte, error) {
 // GobDecode does not fire [OnEvict] for the pre-existing entries it clears,
 // nor [OnFill] for the decoded entries it installs.
 func (c *Cache[K, V]) GobDecode(p []byte) error {
+	registerFillPanicErrorOnGob()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -625,14 +627,19 @@ func (p *fillPanicError) GobDecode(data []byte) error {
 	return nil
 }
 
-// Pre-register fillPanicError with encoding/gob so panic-filled cache
-// entries survive GobEncode/GobDecode without requiring the caller to
-// register an unexported type they can't name. The var-func pattern is
-// used in place of init() to satisfy the gochecknoinits linter.
-var _ = func() struct{} {
-	gob.Register(&fillPanicError{})
-	return struct{}{}
-}()
+// gobRegisterFillPanic ensures fillPanicError is registered with
+// encoding/gob exactly once per process, so panic-filled cache entries
+// round-trip through GobEncode/GobDecode without requiring the caller to
+// register an unexported type they can't name.
+var gobRegisterFillPanic sync.Once
+
+// registerFillPanicErrorOnGob registers fillPanicError with gob on first
+// call. Called from [Cache.GobEncode] and [Cache.GobDecode].
+func registerFillPanicErrorOnGob() {
+	gobRegisterFillPanic.Do(func() {
+		gob.Register(&fillPanicError{})
+	})
+}
 
 // callFetch invokes c.fetch, recovering any panic and converting it into
 // an error wrapping [ErrPanic]. The recovered panic is NOT re-thrown:
