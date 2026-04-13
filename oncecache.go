@@ -176,6 +176,11 @@ func (c *Cache[K, V]) applyOpts(opts []Opt) {
 		case Name:
 			s := string(o)
 			c.name.Store(&s)
+		case *Name:
+			// Name has a value receiver on its marker method, so *Name
+			// also satisfies Opt. Accept pointer-to-Name for forgiveness.
+			s := string(*o)
+			c.name.Store(&s)
 		case logOptConfig:
 			(*logOpt[K, V])(&o).apply(c)
 		case optApplier[K, V]:
@@ -523,12 +528,18 @@ func (c *Cache[K, V]) GobEncode() ([]byte, error) {
 //
 // Unlike other methods, GobDecode is safe to call on a zero-value [Cache]
 // (as gob-provided decoding into `var c Cache[K, V]` will do): it
-// initializes the internal map on demand. The decoded cache will have no
-// fetch func and no callbacks; set those via [New] if needed before
-// further use.
+// initializes the internal map and dispatch functions on demand. The
+// decoded cache will have no fetch func and no callbacks, so further
+// [Cache.Get] for a key not already in the decoded map yields an error
+// wrapping [ErrPanic] (the recovered nil-fetch call).
 //
 // The error type(s) used in entries with non-nil fill errors must be
-// registered with [gob.Register] before encoding/decoding.
+// registered with [gob.Register] before encoding/decoding. The package
+// pre-registers its internal panic-wrapper type, so panic-filled entries
+// also round-trip.
+//
+// Nil map values in a crafted or corrupted gob payload are skipped rather
+// than dereferenced; they do not cause a panic.
 //
 // GobDecode does not fire [OnEvict] for the pre-existing entries it clears,
 // nor [OnFill] for the decoded entries it installs.
@@ -548,7 +559,21 @@ func (c *Cache[K, V]) GobDecode(p []byte) error {
 	} else {
 		clear(c.entries)
 	}
+	// Initialize dispatch functions on demand so a zero-value Cache is
+	// usable for Get / MaybeSet after GobDecode. A decoded cache has no
+	// callbacks, so the fast variants are always correct here.
+	if c.getValueFn == nil {
+		c.getValueFn = getValueFast[K, V]
+	}
+	if c.maybeSetValueFn == nil {
+		c.maybeSetValueFn = maybeSetValueFast[K, V]
+	}
 	for k, e := range gbd.Entries {
+		if e == nil {
+			// A corrupt or crafted gob payload can contain nil map
+			// values. Skip rather than panic on dereference.
+			continue
+		}
 		ent := &entry[K, V]{val: e.Val, err: e.Err}
 		ent.once.Do(func() {}) // Consume the sync.Once
 		ent.filled.Store(true)
@@ -587,6 +612,27 @@ type fillPanicError struct {
 
 func (p *fillPanicError) Error() string { return fmt.Sprintf("%s: %s", ErrPanic, p.recovered) }
 func (p *fillPanicError) Unwrap() error { return ErrPanic }
+
+// GobEncode / GobDecode let fillPanicError round-trip cleanly even though
+// its only field is unexported — gob otherwise encodes no fields, losing
+// the recovered message.
+func (p *fillPanicError) GobEncode() ([]byte, error) {
+	return []byte(p.recovered), nil
+}
+
+func (p *fillPanicError) GobDecode(data []byte) error {
+	p.recovered = string(data)
+	return nil
+}
+
+// Pre-register fillPanicError with encoding/gob so panic-filled cache
+// entries survive GobEncode/GobDecode without requiring the caller to
+// register an unexported type they can't name. The var-func pattern is
+// used in place of init() to satisfy the gochecknoinits linter.
+var _ = func() struct{} {
+	gob.Register(&fillPanicError{})
+	return struct{}{}
+}()
 
 // callFetch invokes c.fetch, recovering any panic and converting it into
 // an error wrapping [ErrPanic]. The recovered panic is NOT re-thrown:

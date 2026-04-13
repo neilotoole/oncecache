@@ -1713,6 +1713,78 @@ func TestLog_DefaultOps(t *testing.T) {
 	}
 }
 
+// TestGobDecode_ZeroCache verifies that decoding into a literal
+// `var c Cache[K, V]` produces a usable cache: Get on decoded keys
+// returns the decoded values, MaybeSet works, and Get on a new key
+// (no fetch func) yields a wrapped ErrPanic instead of panicking.
+func TestGobDecode_ZeroCache(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	c1 := oncecache.New[int, int](fetchDouble, oncecache.Name("zero-src"))
+	_, _ = c1.Get(ctx, 5)
+	_, _ = c1.Get(ctx, 6)
+	data, err := c1.GobEncode()
+	require.NoError(t, err)
+
+	// Decode into a literal zero-value cache.
+	var c2 oncecache.Cache[int, int]
+	require.NoError(t, c2.GobDecode(data))
+	require.Equal(t, "zero-src", c2.Name())
+	require.Equal(t, 2, c2.Len())
+
+	// Get on decoded keys works and returns decoded values.
+	v, err := c2.Get(ctx, 5)
+	require.NoError(t, err)
+	require.Equal(t, 10, v)
+
+	// MaybeSet on a new key works.
+	require.True(t, c2.MaybeSet(ctx, 99, 999, nil))
+	v, err = c2.Get(ctx, 99)
+	require.NoError(t, err)
+	require.Equal(t, 999, v)
+
+	// Get on a key with no decoded entry and nil fetch returns a wrapped
+	// ErrPanic (the recovered nil-pointer dereference).
+	_, err = c2.Get(ctx, 777)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+}
+
+// TestGob_PanicFilledEntry verifies that entries whose fill error wraps
+// [oncecache.ErrPanic] round-trip cleanly through GobEncode/GobDecode —
+// the wrapped-error relationship is preserved on the decoded side.
+func TestGob_PanicFilledEntry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	c1 := oncecache.New[int, int](
+		func(_ context.Context, _ int) (int, error) { panic("gob-me") },
+	)
+	_, err := c1.Get(ctx, 1) // recovers into wrapped ErrPanic
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+
+	data, err := c1.GobEncode()
+	require.NoError(t, err, "gob must support panic-filled entries")
+
+	c2 := oncecache.New[int, int](fetchDouble)
+	require.NoError(t, c2.GobDecode(data))
+	v, err := c2.Get(ctx, 1)
+	require.Zero(t, v)
+	require.ErrorIs(t, err, oncecache.ErrPanic,
+		"decoded cache must preserve the ErrPanic relationship")
+	require.Contains(t, err.Error(), "gob-me",
+		"decoded cache must preserve the panic message")
+}
+
+// TestNew_PtrToName verifies that passing *Name (rather than Name) works
+// — a pointer to the typed alias is accepted rather than panicking.
+func TestNew_PtrToName(t *testing.T) {
+	t.Parallel()
+	n := oncecache.Name("ptr-cache")
+	c := oncecache.New[int, int](fetchDouble, &n)
+	require.Equal(t, "ptr-cache", c.Name())
+}
+
 // BenchmarkGet_Hit measures a single-goroutine steady-state cache hit.
 func BenchmarkGet_Hit(b *testing.B) {
 	ctx := context.Background()
