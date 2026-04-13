@@ -151,7 +151,9 @@ func TestConcurrentDeleteAndFetch(t *testing.T) {
 	ctx := context.Background()
 
 	// Fetch does a bit of work to widen the race window.
-	fetch := func(_ context.Context, k int) (string, error) {
+	const fetchedStr = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" +
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	fetch := func(_ context.Context, _ int) (string, error) {
 		s := ""
 		for i := 0; i < 100; i++ {
 			s += "x"
@@ -166,7 +168,7 @@ func TestConcurrentDeleteAndFetch(t *testing.T) {
 			evictCalls.Add(1)
 			// If filled-flag check works, val is always the fetched value for
 			// evicted-after-fill entries, never a zero/torn read.
-			if val != "" && val != "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" {
+			if val != "" && val != fetchedStr {
 				t.Errorf("torn read on evict: val=%q", val)
 			}
 			if err != nil {
@@ -208,7 +210,7 @@ func TestClearDuringFetch(t *testing.T) {
 
 	c := oncecache.New[int, int](
 		fetch,
-		oncecache.OnEvict(func(_ context.Context, k int, val int, _ error) {
+		oncecache.OnEvict(func(_ context.Context, k, val int, _ error) {
 			if val != k {
 				t.Errorf("torn read on evict: key=%d val=%d", k, val)
 			}
@@ -685,17 +687,20 @@ func TestClose(t *testing.T) {
 	t.Parallel()
 
 	t.Run("nil_cache", func(t *testing.T) {
+		t.Parallel()
 		var c *oncecache.Cache[int, int]
 		require.NoError(t, c.Close())
 	})
 
 	t.Run("idempotent", func(t *testing.T) {
+		t.Parallel()
 		c := oncecache.New[int, int](fetchDouble)
 		require.NoError(t, c.Close())
 		require.NoError(t, c.Close())
 	})
 
 	t.Run("clears_entries", func(t *testing.T) {
+		t.Parallel()
 		ctx := context.Background()
 		c := oncecache.New[int, int](fetchDouble)
 		_, _ = c.Get(ctx, 1)
@@ -705,7 +710,9 @@ func TestClose(t *testing.T) {
 		require.Equal(t, 0, c.Len())
 	})
 
-	t.Run("detaches_callbacks", func(t *testing.T) {
+	// Close does NOT fire OnEvict for the entries it clears.
+	t.Run("no_evict_on_close", func(t *testing.T) {
+		t.Parallel()
 		ctx := context.Background()
 		var evicts atomic.Int64
 		c := oncecache.New[int, int](
@@ -716,11 +723,35 @@ func TestClose(t *testing.T) {
 		)
 		_, _ = c.Get(ctx, 1)
 		require.NoError(t, c.Close())
-		// OnEvict is not invoked by Close.
-		require.Equal(t, int64(0), evicts.Load())
-		// And after Close, Delete also doesn't fire OnEvict (callbacks detached).
-		c.Delete(ctx, 1)
-		require.Equal(t, int64(0), evicts.Load())
+		require.Equal(t, int64(0), evicts.Load(),
+			"Close must not fire OnEvict for the entries it clears")
+	})
+
+	// Callbacks survive Close: re-using the cache after Close still fires
+	// callbacks as normal. Close only clears entries; it does not detach
+	// callbacks.
+	t.Run("callbacks_survive_close", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		var fills, evicts atomic.Int64
+		c := oncecache.New[int, int](
+			fetchDouble,
+			oncecache.OnFill(func(_ context.Context, _, _ int, _ error) {
+				fills.Add(1)
+			}),
+			oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) {
+				evicts.Add(1)
+			}),
+		)
+		_, _ = c.Get(ctx, 1) // fill
+		require.Equal(t, int64(1), fills.Load())
+		require.NoError(t, c.Close())
+
+		// After Close: refill and delete — both callbacks still fire.
+		_, _ = c.Get(ctx, 2)
+		require.Equal(t, int64(2), fills.Load())
+		c.Delete(ctx, 2)
+		require.Equal(t, int64(1), evicts.Load())
 	})
 }
 
@@ -759,7 +790,7 @@ func TestOnMiss(t *testing.T) {
 	var mu sync.Mutex
 	c := oncecache.New[int, int](
 		fetchDouble,
-		oncecache.OnMiss(func(_ context.Context, k int, _ int, _ error) {
+		oncecache.OnMiss(func(_ context.Context, k, _ int, _ error) {
 			mu.Lock()
 			missKeys = append(missKeys, k)
 			mu.Unlock()
@@ -853,7 +884,7 @@ func TestFetchPanic(t *testing.T) {
 			fetchCalls.Add(1)
 			panic("boom")
 		},
-		oncecache.OnMiss(func(_ context.Context, _ int, _ int, _ error) {
+		oncecache.OnMiss(func(_ context.Context, _, _ int, _ error) {
 			missCalls.Add(1)
 		}),
 		oncecache.OnFill(func(_ context.Context, _, _ int, _ error) {
@@ -891,19 +922,27 @@ func TestGob_Empty(t *testing.T) {
 	require.Equal(t, "empty", c2.Name())
 }
 
-// gobErr is a gob-registerable error type used by [TestGob_PreservesError].
-type gobErr string
+// gobError is a gob-registerable error type used by
+// [TestGob_PreservesError].
+type gobError string
 
-func (e gobErr) Error() string { return string(e) }
+func (e gobError) Error() string { return string(e) }
 
-func init() { gob.Register(gobErr("")) }
+// registerGobErrorOnce registers gobError with gob exactly once across all
+// tests, even if multiple tests use it. This avoids an init() func (which
+// the linter forbids) while also avoiding double-registration across
+// parallel tests.
+var registerGobErrorOnce sync.Once
+
+func registerGobError() { registerGobErrorOnce.Do(func() { gob.Register(gobError("")) }) }
 
 // TestGob_PreservesError verifies that fill errors survive gob round-trip.
 func TestGob_PreservesError(t *testing.T) {
 	t.Parallel()
+	registerGobError()
 	ctx := context.Background()
 
-	myErr := gobErr("boom")
+	myErr := gobError("boom")
 	c1 := oncecache.New[int, int](
 		func(_ context.Context, k int) (int, error) {
 			if k == 0 {
@@ -1101,7 +1140,8 @@ func TestEvent_Ctx(t *testing.T) {
 
 // TestConcurrentCloseAndGet verifies that Close races safely against Get.
 // With Close simplified to just clear entries (not detach callbacks), the
-// race detector should stay quiet.
+// race detector should stay quiet. Post-race, every remaining entry's
+// value must match the fetchDouble contract — detecting any torn read.
 func TestConcurrentCloseAndGet(t *testing.T) {
 	t.Parallel()
 
@@ -1112,7 +1152,9 @@ func TestConcurrentCloseAndGet(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			_, _ = c.Get(context.Background(), i)
+			v, err := c.Get(context.Background(), i)
+			require.NoError(t, err)
+			require.Equal(t, i*2, v, "value invariant must hold under concurrent Close")
 		}
 	}()
 	go func() {
@@ -1177,7 +1219,7 @@ func TestDelete_Reentry(t *testing.T) {
 	var c *oncecache.Cache[int, int]
 	c = oncecache.New[int, int](
 		fetchDouble,
-		oncecache.OnEvict(func(_ context.Context, k int, _ int, _ error) {
+		oncecache.OnEvict(func(_ context.Context, k, _ int, _ error) {
 			// Touch the cache from inside the eviction callback. With the
 			// pre-fix code that held c.mu across callbacks, all of these
 			// would deadlock.
@@ -1406,6 +1448,7 @@ func TestEntry_LogValue_Types(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("int_logged", func(t *testing.T) {
+		t.Parallel()
 		buf, log := newBufLogger()
 		c := oncecache.New[int, int](
 			fetchDouble,
@@ -1417,9 +1460,10 @@ func TestEntry_LogValue_Types(t *testing.T) {
 	})
 
 	t.Run("string_not_logged", func(t *testing.T) {
+		t.Parallel()
 		buf, log := newBufLogger()
 		c := oncecache.New[int, string](
-			func(_ context.Context, k int) (string, error) { return "secret", nil },
+			func(_ context.Context, _ int) (string, error) { return "secret", nil },
 			oncecache.Name("strs"),
 			oncecache.Log(log, slog.LevelInfo, oncecache.OpFill),
 		)
@@ -1429,9 +1473,10 @@ func TestEntry_LogValue_Types(t *testing.T) {
 	})
 
 	t.Run("logvaluer_logged", func(t *testing.T) {
+		t.Parallel()
 		buf, log := newBufLogger()
 		c := oncecache.New[int, hasLogValue](
-			func(_ context.Context, k int) (hasLogValue, error) {
+			func(_ context.Context, _ int) (hasLogValue, error) {
 				return hasLogValue{tag: "TAGGED"}, nil
 			},
 			oncecache.Name("lv"),
@@ -1442,9 +1487,10 @@ func TestEntry_LogValue_Types(t *testing.T) {
 	})
 
 	t.Run("struct_not_logged", func(t *testing.T) {
+		t.Parallel()
 		buf, log := newBufLogger()
 		c := oncecache.New[int, plainStruct](
-			func(_ context.Context, k int) (plainStruct, error) {
+			func(_ context.Context, _ int) (plainStruct, error) {
 				return plainStruct{secret: "nope"}, nil
 			},
 			oncecache.Name("ps"),
@@ -1535,7 +1581,7 @@ func TestCache_AsSlogAttribute(t *testing.T) {
 	t.Parallel()
 	buf, log := newBufLogger()
 	c := oncecache.New[int, string](
-		func(_ context.Context, k int) (string, error) { return "v", nil },
+		func(_ context.Context, _ int) (string, error) { return "v", nil },
 		oncecache.Name("attr-cache"),
 	)
 	_, _ = c.Get(context.Background(), 1)
@@ -1549,9 +1595,11 @@ func TestCache_AsSlogAttribute(t *testing.T) {
 }
 
 // TestStress runs random concurrent Get/MaybeSet/Delete/Clear/Has/Keys
-// operations against the cache for a fixed duration. Its job is to
-// surface races, deadlocks, and panics that targeted tests may miss.
-// Run with -race to be useful.
+// operations against the cache. Its primary job is to surface races,
+// deadlocks, and panics under -race. A Get or MaybeSet for any key k
+// produces a value that is either fetchDouble(k) = k*2 or the MaybeSet
+// value k*10 — any other observed value is a torn read and fails the
+// test invariant.
 func TestStress(t *testing.T) {
 	t.Parallel()
 	const goroutines = 32
@@ -1569,10 +1617,16 @@ func TestStress(t *testing.T) {
 		oncecache.OnHit(func(_ context.Context, _, _ int, _ error) {}),
 	)
 
+	checkValue := func(key, val int) {
+		if val != key*2 && val != key*10 {
+			t.Errorf("torn read: key=%d got val=%d (expected %d or %d)",
+				key, val, key*2, key*10)
+		}
+	}
+
 	wg := &sync.WaitGroup{}
 	wg.Add(goroutines)
 	for g := 0; g < goroutines; g++ {
-		g := g
 		go func() {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(int64(g)))
@@ -1581,7 +1635,10 @@ func TestStress(t *testing.T) {
 				key := rng.Intn(keyspace)
 				switch rng.Intn(6) {
 				case 0:
-					_, _ = c.Get(ctx, key)
+					v, err := c.Get(ctx, key)
+					if err == nil {
+						checkValue(key, v)
+					}
 				case 1:
 					_ = c.MaybeSet(ctx, key, key*10, nil)
 				case 2:

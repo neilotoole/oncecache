@@ -41,7 +41,10 @@ func TestRandomName_Format(t *testing.T) {
 			t.Fatalf("expected 8 hex digits, got %d in %q", len(hex), name)
 		}
 		for _, r := range hex {
-			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			switch {
+			case r >= '0' && r <= '9':
+			case r >= 'a' && r <= 'f':
+			default:
 				t.Fatalf("non-hex character %q in %q", r, name)
 			}
 		}
@@ -108,9 +111,9 @@ func TestIsNil(t *testing.T) {
 	if isNil(struct{}{}) {
 		t.Error("empty struct must not be nil")
 	}
-	type s2 struct{ x int }
-	if isNil(s2{}) {
-		t.Error("zero-value struct must not be nil")
+	type withField struct{ N int }
+	if isNil(withField{N: 42}) {
+		t.Error("non-empty struct must not be nil")
 	}
 }
 
@@ -140,10 +143,11 @@ func TestUniq(t *testing.T) {
 // string and its Unwrap chain.
 func TestFillPanic_Error_Format(t *testing.T) {
 	t.Parallel()
-	p := &fillPanic{recovered: "boom"}
+	p := &fillPanicError{recovered: "boom"}
 	if !strings.HasSuffix(p.Error(), ": boom") {
 		t.Errorf("error format: %q", p.Error())
 	}
+	//nolint:errorlint // directly checking the immediate Unwrap target, not chain.
 	if p.Unwrap() != ErrPanic {
 		t.Errorf("Unwrap should yield ErrPanic, got %v", p.Unwrap())
 	}

@@ -221,10 +221,10 @@ type Cache[K comparable, V any] struct {
 	// maybeSetValueFn and getValueFn are selected at construction time
 	// based on which callbacks are registered. The "fast" variants skip
 	// callback-iteration overhead when no relevant callbacks exist. The
-	// cache is passed as the first argument rather than stored on each
-	// entry, saving one pointer per entry.
-	maybeSetValueFn func(c *Cache[K, V], ctx context.Context, e *entry[K, V], key K, val V, err error) bool
-	getValueFn      func(c *Cache[K, V], ctx context.Context, e *entry[K, V], key K) (V, error)
+	// cache is passed as an argument rather than stored on each entry,
+	// saving one pointer per entry.
+	maybeSetValueFn func(ctx context.Context, c *Cache[K, V], e *entry[K, V], key K, val V, err error) bool
+	getValueFn      func(ctx context.Context, c *Cache[K, V], e *entry[K, V], key K) (V, error)
 
 	// name is set via the Name opt, or a random value if not specified.
 	// Stored as atomic.Pointer[string] so [Cache.Name] / [Cache.String] /
@@ -397,7 +397,7 @@ func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 // [OnMiss] is not emitted, since MaybeSet is not a [Cache.Get] miss.
 func (c *Cache[K, V]) MaybeSet(ctx context.Context, key K, val V, err error) (ok bool) {
 	e := c.getEntry(key)
-	return c.maybeSetValueFn(c, ctx, e, key, val, err)
+	return c.maybeSetValueFn(ctx, c, e, key, val, err)
 }
 
 // Get returns the cached value (and fill error) for key. On a cache miss,
@@ -414,11 +414,13 @@ func (c *Cache[K, V]) MaybeSet(ctx context.Context, key K, val V, err error) (ok
 // Concurrent Get calls for the same unfilled key block until the in-flight
 // fetch completes and then all receive the same (val, err).
 //
-// If fetch panics, the panic propagates to this Get caller; see [FetchFunc]
-// for the post-panic entry state.
+// If fetch panics, the panic is recovered and converted into a fill error
+// wrapping [ErrPanic]; Get returns (zero, that wrapped error) instead of
+// propagating the panic. [OpFill] still fires with the wrapped error. See
+// [FetchFunc] for details.
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, error) {
 	e := c.getEntry(key)
-	return c.getValueFn(c, ctx, e, key)
+	return c.getValueFn(ctx, c, e, key)
 }
 
 // getEntry returns the entry for key, creating (but not yet populating) one
@@ -515,6 +517,12 @@ func (c *Cache[K, V]) GobEncode() ([]byte, error) {
 // are marked as filled, so subsequent [Cache.Get] calls return them directly
 // without invoking fetch.
 //
+// Unlike other methods, GobDecode is safe to call on a zero-value [Cache]
+// (as gob-provided decoding into `var c Cache[K, V]` will do): it
+// initializes the internal map on demand. The decoded cache will have no
+// fetch func and no callbacks; set those via [New] if needed before
+// further use.
+//
 // The error type(s) used in entries with non-nil fill errors must be
 // registered with [gob.Register] before encoding/decoding.
 //
@@ -531,7 +539,11 @@ func (c *Cache[K, V]) GobDecode(p []byte) error {
 
 	name := gbd.Name
 	c.name.Store(&name)
-	clear(c.entries)
+	if c.entries == nil {
+		c.entries = make(map[K]*entry[K, V], len(gbd.Entries))
+	} else {
+		clear(c.entries)
+	}
 	for k, e := range gbd.Entries {
 		ent := &entry[K, V]{val: e.Val, err: e.Err}
 		ent.once.Do(func() {}) // Consume the sync.Once
@@ -560,15 +572,17 @@ type entry[K comparable, V any] struct {
 	filled atomic.Bool
 }
 
-// fillPanic wraps a recovered panic value into an error that can be stored
-// in a cache entry. It unwraps to [ErrPanic] so callers can test via
-// [errors.Is].
-type fillPanic struct {
-	recovered any
+// fillPanicError wraps a recovered panic value into an error that can be
+// stored in a cache entry. It unwraps to [ErrPanic] so callers can test
+// via [errors.Is]. The recovered panic value is stored as its formatted
+// string representation (not as any) so that errorful entries remain
+// gob-encodable — see [Cache.GobEncode].
+type fillPanicError struct {
+	recovered string
 }
 
-func (p *fillPanic) Error() string { return fmt.Sprintf("%s: %v", ErrPanic, p.recovered) }
-func (p *fillPanic) Unwrap() error { return ErrPanic }
+func (p *fillPanicError) Error() string { return fmt.Sprintf("%s: %s", ErrPanic, p.recovered) }
+func (p *fillPanicError) Unwrap() error { return ErrPanic }
 
 // callFetch invokes c.fetch, recovering any panic and converting it into
 // an error wrapping [ErrPanic]. The recovered panic is NOT re-thrown:
@@ -577,12 +591,12 @@ func (p *fillPanic) Unwrap() error { return ErrPanic }
 //
 // Callback panics (OnMiss, OnFill, OnHit, OnEvict) are deliberately not
 // recovered here; they propagate to the triggering caller.
-func callFetch[K comparable, V any](c *Cache[K, V], ctx context.Context, key K) (val V, err error) {
+func callFetch[K comparable, V any](ctx context.Context, c *Cache[K, V], key K) (val V, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			var zero V
 			val = zero
-			err = &fillPanic{recovered: r}
+			err = &fillPanicError{recovered: fmt.Sprintf("%v", r)}
 		}
 	}()
 	return c.fetch(ctx, key)
@@ -590,7 +604,9 @@ func callFetch[K comparable, V any](c *Cache[K, V], ctx context.Context, key K) 
 
 // maybeSetValueSlow is the MaybeSet core used when OnFill callbacks are
 // registered. See maybeSetValueFast for the no-callback path.
-func maybeSetValueSlow[K comparable, V any](c *Cache[K, V], ctx context.Context, e *entry[K, V], key K, val V, err error) bool {
+func maybeSetValueSlow[K comparable, V any](
+	ctx context.Context, c *Cache[K, V], e *entry[K, V], key K, val V, err error,
+) bool {
 	var ok bool
 	e.once.Do(func() {
 		ok = true
@@ -607,7 +623,9 @@ func maybeSetValueSlow[K comparable, V any](c *Cache[K, V], ctx context.Context,
 
 // maybeSetValueFast is the MaybeSet core used when no OnFill callbacks are
 // registered. It skips callback iteration and the NewContext decoration.
-func maybeSetValueFast[K comparable, V any](_ *Cache[K, V], _ context.Context, e *entry[K, V], _ K, val V, err error) bool {
+func maybeSetValueFast[K comparable, V any](
+	_ context.Context, _ *Cache[K, V], e *entry[K, V], _ K, val V, err error,
+) bool {
 	var ok bool
 	e.once.Do(func() {
 		e.val = val
@@ -624,7 +642,7 @@ func maybeSetValueFast[K comparable, V any](_ *Cache[K, V], _ context.Context, e
 // all inside the entry's sync.Once. On hit it fires OnHit outside the Once
 // (safe: the Once's completion synchronizes the val/err writes for later
 // readers).
-func getValueSlow[K comparable, V any](c *Cache[K, V], ctx context.Context, e *entry[K, V], key K) (V, error) {
+func getValueSlow[K comparable, V any](ctx context.Context, c *Cache[K, V], e *entry[K, V], key K) (V, error) {
 	var miss bool
 	e.once.Do(func() {
 		miss = true
@@ -633,7 +651,7 @@ func getValueSlow[K comparable, V any](c *Cache[K, V], ctx context.Context, e *e
 			fn(cbCtx, key, e.val, e.err)
 		}
 
-		e.val, e.err = callFetch(c, cbCtx, key)
+		e.val, e.err = callFetch(cbCtx, c, key)
 		e.filled.Store(true)
 
 		for _, fn := range c.onFill {
@@ -654,10 +672,10 @@ func getValueSlow[K comparable, V any](c *Cache[K, V], ctx context.Context, e *e
 // getValueFast is the Get core used when no Get-triggered callbacks are
 // registered, which is the common case. It skips the OnMiss/OnFill/OnHit
 // iteration entirely.
-func getValueFast[K comparable, V any](c *Cache[K, V], ctx context.Context, e *entry[K, V], key K) (V, error) {
+func getValueFast[K comparable, V any](ctx context.Context, c *Cache[K, V], e *entry[K, V], key K) (V, error) {
 	e.once.Do(func() {
 		cbCtx := NewContext(ctx, c)
-		e.val, e.err = callFetch(c, cbCtx, key)
+		e.val, e.err = callFetch(cbCtx, c, key)
 		e.filled.Store(true)
 	})
 
@@ -724,8 +742,8 @@ func isNil(x any) bool {
 	if x == nil {
 		return true
 	}
-	v := reflect.ValueOf(x)
-	switch v.Kind() {
+	//nolint:exhaustive // only nilable kinds are listed; all others fall through to false.
+	switch v := reflect.ValueOf(x); v.Kind() {
 	case reflect.Pointer, reflect.Chan, reflect.Func,
 		reflect.Interface, reflect.Map, reflect.Slice:
 		return v.IsNil()

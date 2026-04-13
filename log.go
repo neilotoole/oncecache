@@ -205,7 +205,7 @@ func (e Event[K, V]) String() string {
 	sb.WriteRune('.')
 	sb.WriteString(e.Op.String())
 	sb.WriteRune('[')
-	sb.WriteString(fmt.Sprintf("%v", e.Key))
+	fmt.Fprintf(&sb, "%v", e.Key)
 	sb.WriteRune(']')
 	if e.Err != nil {
 		sb.WriteString("[! ")
@@ -223,7 +223,7 @@ func (e Entry[K, V]) String() string {
 	sb := strings.Builder{}
 	sb.WriteString(e.Cache.Name())
 	sb.WriteRune('[')
-	sb.WriteString(fmt.Sprintf("%v", e.Key))
+	fmt.Fprintf(&sb, "%v", e.Key)
 	sb.WriteRune(']')
 	if e.Err != nil {
 		sb.WriteString("[! ")

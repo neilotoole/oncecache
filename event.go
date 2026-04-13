@@ -193,10 +193,9 @@ func OnFill[K comparable, V any](fn func(ctx context.Context, key K, val V, err 
 // the time of eviction.
 //
 // OnEvict callbacks run synchronously on the goroutine that triggered the
-// eviction, while [Cache]'s internal lock is held. They must therefore not
-// call any method on the same cache (that would deadlock). Calls on other
-// caches are fine — this is the foundation of the composite-cache
-// propagation pattern.
+// eviction, after [Cache]'s internal lock has been released. fn may
+// therefore safely call methods on the same cache (or on other caches —
+// this is the foundation of the composite-cache propagation pattern).
 //
 // If the entry is still being filled when [Cache.Delete] or [Cache.Clear]
 // runs, OnEvict is not invoked for that entry; see [Cache.Delete].
@@ -250,8 +249,9 @@ const (
 
 	// OpMiss indicates a cache miss: [Cache.Get] found no entry for the
 	// key and is about to invoke [FetchFunc]. OpMiss fires once per entry
-	// lifetime and is (in the normal case) immediately followed by
-	// [OpFill]. If [FetchFunc] panics, OpFill will not fire; see
+	// lifetime and is immediately followed by [OpFill] — including when
+	// [FetchFunc] panics, in which case the panic is recovered into an
+	// error wrapping [ErrPanic] and OpFill carries that error. See
 	// [FetchFunc].
 	OpMiss Op = 2
 
