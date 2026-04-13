@@ -19,3 +19,6 @@
 
 # Go workspace file
 go.work
+
+# Claude Code local tooling (per-developer permissions, run state)
+.claude/
