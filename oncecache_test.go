@@ -1753,6 +1753,160 @@ func BenchmarkGet_Parallel_Hit(b *testing.B) {
 	})
 }
 
+// BenchmarkGet_Parallel_Miss measures concurrent cache misses across
+// unique keys — each call creates a new entry and invokes fetch exactly
+// once. Contrast with [BenchmarkGet_Parallel_Hit]: this one exercises the
+// map-insertion path under contention.
+func BenchmarkGet_Parallel_Miss(b *testing.B) {
+	ctx := context.Background()
+	c := oncecache.New[int, int](fetchDouble)
+	var key atomic.Int64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = c.Get(ctx, int(key.Add(1)))
+		}
+	})
+}
+
+// BenchmarkGet_Hit_WithCallbacks measures the "slow path" hit cost when
+// all four callback kinds are registered. Compare to [BenchmarkGet_Hit]
+// for the callback-dispatch overhead.
+func BenchmarkGet_Hit_WithCallbacks(b *testing.B) {
+	noop4 := func(_ context.Context, _, _ int, _ error) {}
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnHit(noop4),
+		oncecache.OnMiss(noop4),
+		oncecache.OnFill(noop4),
+		oncecache.OnEvict(noop4),
+	)
+	ctx := context.Background()
+	_, _ = c.Get(ctx, 42)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = c.Get(ctx, 42)
+	}
+}
+
+// BenchmarkGet_Miss_WithCallbacks measures the slow-path miss cost. Compare
+// to [BenchmarkGet_Miss] for the callback-dispatch overhead on miss.
+func BenchmarkGet_Miss_WithCallbacks(b *testing.B) {
+	noop4 := func(_ context.Context, _, _ int, _ error) {}
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnHit(noop4),
+		oncecache.OnMiss(noop4),
+		oncecache.OnFill(noop4),
+	)
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = c.Get(ctx, i)
+	}
+}
+
+// BenchmarkGet_Miss_Panic measures the per-miss overhead when fetch
+// panics and the panic is recovered into a wrapped [oncecache.ErrPanic].
+// Compare to [BenchmarkGet_Miss] to isolate the recover/wrap cost.
+func BenchmarkGet_Miss_Panic(b *testing.B) {
+	c := oncecache.New[int, int](
+		func(_ context.Context, _ int) (int, error) { panic("bench-panic") },
+	)
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = c.Get(ctx, i)
+	}
+}
+
+// BenchmarkMaybeSet_Existing measures MaybeSet on an already-filled
+// entry — the common case in composite-cache propagation where the same
+// value is offered repeatedly. The call returns false without writing.
+func BenchmarkMaybeSet_Existing(b *testing.B) {
+	c := oncecache.New[int, int](fetchDouble)
+	ctx := context.Background()
+	c.MaybeSet(ctx, 42, 84, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = c.MaybeSet(ctx, 42, 84, nil)
+	}
+}
+
+// BenchmarkDelete measures the Get+Delete cycle without an OnEvict
+// callback (fast path: no snapshot, no callback invocation).
+func BenchmarkDelete(b *testing.B) {
+	ctx := context.Background()
+	c := oncecache.New[int, int](fetchDouble)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = c.Get(ctx, i)
+		c.Delete(ctx, i)
+	}
+}
+
+// BenchmarkDelete_WithCallback measures the Get+Delete cycle with an
+// OnEvict callback, exercising the snapshot-then-invoke-outside-lock
+// path added in the Delete/Clear concurrency fix. Compare to
+// [BenchmarkDelete] for the callback-path overhead.
+func BenchmarkDelete_WithCallback(b *testing.B) {
+	ctx := context.Background()
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) {}),
+	)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = c.Get(ctx, i)
+		c.Delete(ctx, i)
+	}
+}
+
+// BenchmarkHas measures the cheap presence check on an existing key.
+func BenchmarkHas(b *testing.B) {
+	c := oncecache.New[int, int](fetchDouble)
+	_, _ = c.Get(context.Background(), 42)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = c.Has(42)
+	}
+}
+
+// BenchmarkOnEvent_NonBlocking measures the per-hit overhead of emitting
+// an [OnEvent] on a saturated (unbuffered, no receiver) channel with
+// block=false — every event is dropped. Baseline for event-system cost.
+func BenchmarkOnEvent_NonBlocking(b *testing.B) {
+	ctx := context.Background()
+	ch := make(chan oncecache.Event[int, int]) // unbuffered, no reader
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvent(ch, false, oncecache.OpHit),
+	)
+	_, _ = c.Get(ctx, 42) // prime
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = c.Get(ctx, 42)
+	}
+}
+
 //nolint:revive
 func ExampleCache_Keys() {
 	// Ignore error handling for brevity.
