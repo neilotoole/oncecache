@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"slices"
 	"strconv"
 	"sync"
@@ -1208,6 +1209,450 @@ func TestClear_Reentry(t *testing.T) {
 	_, _ = c.Get(ctx, 1)
 	_, _ = c.Get(ctx, 2)
 	c.Clear(ctx)
+}
+
+// TestErrPanic_IsTarget verifies that errors.Is(err, ErrPanic) matches the
+// wrapped error returned by Get after a fetch panic.
+func TestErrPanic_IsTarget(t *testing.T) {
+	t.Parallel()
+	c := oncecache.New[int, int](
+		func(_ context.Context, _ int) (int, error) {
+			panic(errors.New("boom-as-error"))
+		},
+	)
+	_, err := c.Get(context.Background(), 1)
+	require.Error(t, err)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+	require.Equal(t, oncecache.ErrPanic, errors.Unwrap(err))
+	require.Contains(t, err.Error(), "boom-as-error")
+}
+
+// TestFetchPanic_MaybeSetIsNoop verifies that after a panicked fetch
+// has filled the entry with a wrapped error, MaybeSet for that key is
+// a no-op (the entry is already considered filled).
+func TestFetchPanic_MaybeSetIsNoop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := oncecache.New[int, string](
+		func(_ context.Context, _ int) (string, error) { panic("boom") },
+	)
+	_, _ = c.Get(ctx, 1) // panic recovered → entry filled with wrapped err
+	require.False(t, c.MaybeSet(ctx, 1, "override", nil))
+	_, err := c.Get(ctx, 1)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+}
+
+// TestGet_NilFetch verifies that constructing a cache with a nil fetch
+// and then calling Get on an unfilled key returns a wrapped ErrPanic
+// (the recovered nil-pointer dereference) rather than propagating the
+// panic. The cache is otherwise usable via MaybeSet.
+func TestGet_NilFetch(t *testing.T) {
+	t.Parallel()
+	c := oncecache.New[int, int](nil)
+
+	v, err := c.Get(context.Background(), 1)
+	require.Zero(t, v)
+	require.ErrorIs(t, err, oncecache.ErrPanic,
+		"nil fetch should be recovered into a wrapped ErrPanic, not propagated")
+
+	// MaybeSet works with nil fetch.
+	require.True(t, c.MaybeSet(context.Background(), 2, 22, nil))
+	v, err = c.Get(context.Background(), 2)
+	require.NoError(t, err)
+	require.Equal(t, 22, v)
+}
+
+// TestConcurrentMaybeSet verifies that, under heavy concurrent MaybeSet
+// for the same key, exactly one call wins (returns true) and all others
+// return false. The winner's value is what subsequent Get observes.
+func TestConcurrentMaybeSet(t *testing.T) {
+	t.Parallel()
+	const concurrency = 200
+	c := oncecache.New[int, int](fetchDouble)
+
+	var winners atomic.Int64
+	wg := &sync.WaitGroup{}
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			if c.MaybeSet(context.Background(), 7, i, nil) {
+				winners.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, int64(1), winners.Load(), "exactly one MaybeSet must win")
+
+	// Whatever value won is consistent across subsequent reads.
+	v1, _ := c.Get(context.Background(), 7)
+	v2, _ := c.Get(context.Background(), 7)
+	require.Equal(t, v1, v2)
+	require.GreaterOrEqual(t, v1, 0)
+	require.Less(t, v1, concurrency)
+}
+
+// TestMaybeSet_VsGetConcurrent verifies that under a race between Get
+// (which would invoke fetch) and MaybeSet (which would set directly),
+// exactly one populates the entry; both eventual reads agree.
+func TestMaybeSet_VsGetConcurrent(t *testing.T) {
+	t.Parallel()
+	const iters = 500
+	for i := 0; i < iters; i++ {
+		var fetchCalls atomic.Int64
+		c := oncecache.New[int, int](
+			func(_ context.Context, k int) (int, error) {
+				fetchCalls.Add(1)
+				return k * 2, nil
+			},
+		)
+		wg := &sync.WaitGroup{}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = c.MaybeSet(context.Background(), 1, 999, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = c.Get(context.Background(), 1)
+		}()
+		wg.Wait()
+
+		v, err := c.Get(context.Background(), 1)
+		require.NoError(t, err)
+		// The winner is either MaybeSet (v=999) or Get's fetch (v=2).
+		require.Contains(t, []int{2, 999}, v)
+		// Fetch ran at most once (zero if MaybeSet won the race).
+		require.LessOrEqual(t, fetchCalls.Load(), int64(1))
+	}
+}
+
+// TestOnHit_ErrorEntry verifies that OnHit fires when Get returns an
+// already-stored fill error (errorful entries are valid hits).
+func TestOnHit_ErrorEntry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	wantErr := errors.New("nope")
+	var hits atomic.Int64
+	c := oncecache.New[int, string](
+		func(_ context.Context, _ int) (string, error) { return "", wantErr },
+		oncecache.OnHit(func(_ context.Context, _ int, val string, err error) {
+			require.Empty(t, val)
+			require.Equal(t, wantErr, err)
+			hits.Add(1)
+		}),
+	)
+	_, _ = c.Get(ctx, 1) // miss → fill (error)
+	_, err := c.Get(ctx, 1)
+	require.ErrorIs(t, err, wantErr)
+	require.Equal(t, int64(1), hits.Load())
+}
+
+// TestOnFill_PanicPropagates verifies that callback panics are NOT
+// recovered (only fetch panics are). The panic propagates to the Get
+// caller, but the entry is still filled, so subsequent Gets succeed.
+func TestOnFill_PanicPropagates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnFill(func(_ context.Context, _, _ int, _ error) { panic("cb-boom") }),
+	)
+	require.PanicsWithValue(t, "cb-boom", func() { _, _ = c.Get(ctx, 1) })
+	// The entry was filled before OnFill ran, so subsequent Gets succeed
+	// (and fire OnHit if registered, not OnFill again).
+	v, err := c.Get(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, 2, v)
+}
+
+// TestOnEvict_PanicPropagates verifies that OnEvict panics propagate to
+// the Delete caller. The entry is removed before OnEvict runs.
+func TestOnEvict_PanicPropagates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) { panic("evict-boom") }),
+	)
+	_, _ = c.Get(ctx, 1)
+	require.PanicsWithValue(t, "evict-boom", func() { c.Delete(ctx, 1) })
+	require.False(t, c.Has(1), "entry must be removed even though OnEvict panicked")
+}
+
+// TestLog_NilLevel verifies that passing a nil leveler to Log defaults
+// to slog.LevelInfo and produces output.
+func TestLog_NilLevel(t *testing.T) {
+	t.Parallel()
+	buf, log := newBufLogger()
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.Name("nillevel"),
+		oncecache.Log(log, nil, oncecache.OpFill),
+	)
+	_, _ = c.Get(context.Background(), 1)
+	out := buf.String()
+	require.Contains(t, out, "level=INFO")
+	require.Contains(t, out, "ev.cache=nillevel")
+	require.Contains(t, out, "ev.op=fill")
+}
+
+// TestEntry_LogValue_Types verifies isValLogged behavior across V types:
+// numerics, bool, slog.LogValuer types are logged; string and arbitrary
+// structs are not.
+func TestEntry_LogValue_Types(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("int_logged", func(t *testing.T) {
+		buf, log := newBufLogger()
+		c := oncecache.New[int, int](
+			fetchDouble,
+			oncecache.Name("ints"),
+			oncecache.Log(log, slog.LevelInfo, oncecache.OpFill),
+		)
+		_, _ = c.Get(ctx, 5)
+		require.Contains(t, buf.String(), "ev.v=10")
+	})
+
+	t.Run("string_not_logged", func(t *testing.T) {
+		buf, log := newBufLogger()
+		c := oncecache.New[int, string](
+			func(_ context.Context, k int) (string, error) { return "secret", nil },
+			oncecache.Name("strs"),
+			oncecache.Log(log, slog.LevelInfo, oncecache.OpFill),
+		)
+		_, _ = c.Get(ctx, 1)
+		require.NotContains(t, buf.String(), "secret",
+			"string V must not appear in slog output")
+	})
+
+	t.Run("logvaluer_logged", func(t *testing.T) {
+		buf, log := newBufLogger()
+		c := oncecache.New[int, hasLogValue](
+			func(_ context.Context, k int) (hasLogValue, error) {
+				return hasLogValue{tag: "TAGGED"}, nil
+			},
+			oncecache.Name("lv"),
+			oncecache.Log(log, slog.LevelInfo, oncecache.OpFill),
+		)
+		_, _ = c.Get(ctx, 1)
+		require.Contains(t, buf.String(), "TAGGED")
+	})
+
+	t.Run("struct_not_logged", func(t *testing.T) {
+		buf, log := newBufLogger()
+		c := oncecache.New[int, plainStruct](
+			func(_ context.Context, k int) (plainStruct, error) {
+				return plainStruct{secret: "nope"}, nil
+			},
+			oncecache.Name("ps"),
+			oncecache.Log(log, slog.LevelInfo, oncecache.OpFill),
+		)
+		_, _ = c.Get(ctx, 1)
+		require.NotContains(t, buf.String(), "nope",
+			"plain struct V must not appear in slog output")
+	})
+}
+
+// hasLogValue is a V type implementing slog.LogValuer.
+type hasLogValue struct {
+	tag string
+}
+
+func (h hasLogValue) LogValue() slog.Value { return slog.StringValue(h.tag) }
+
+// plainStruct is a V type that does NOT implement slog.LogValuer.
+type plainStruct struct {
+	secret string
+}
+
+// TestEntry_String verifies the compact debug format with and without err.
+func TestEntry_String(t *testing.T) {
+	t.Parallel()
+	c := oncecache.New[int, int](fetchDouble, oncecache.Name("nm"))
+
+	ev := oncecache.Entry[int, int]{Cache: c, Key: 7, Val: 14}
+	require.Equal(t, "nm[7]", ev.String())
+
+	ev.Err = errors.New("oof")
+	require.Equal(t, "nm[7][! oof]", ev.String())
+}
+
+// TestEvent_String verifies the compact debug format for events.
+func TestEvent_String(t *testing.T) {
+	t.Parallel()
+	c := oncecache.New[int, int](fetchDouble, oncecache.Name("nm"))
+
+	e := oncecache.Event[int, int]{
+		Op:    oncecache.OpHit,
+		Entry: oncecache.Entry[int, int]{Cache: c, Key: 7, Val: 14},
+	}
+	require.Equal(t, "nm.hit[7]", e.String())
+
+	e.Err = errors.New("oof")
+	require.Equal(t, "nm.hit[7][! oof]", e.String())
+}
+
+// TestOp_IsZero_All verifies that all defined Op constants are non-zero
+// and only the zero-value Op reports IsZero.
+func TestOp_IsZero_All(t *testing.T) {
+	t.Parallel()
+	for _, op := range []oncecache.Op{oncecache.OpHit, oncecache.OpMiss, oncecache.OpFill, oncecache.OpEvict} {
+		require.False(t, op.IsZero(), "%s must not be zero", op)
+	}
+	require.True(t, oncecache.Op(0).IsZero())
+}
+
+// TestNewContext_PreservesParent verifies that NewContext does not destroy
+// pre-existing values on the parent context.
+func TestNewContext_PreservesParent(t *testing.T) {
+	t.Parallel()
+	type k struct{}
+	parent := context.WithValue(context.Background(), k{}, "parent-value")
+	c := oncecache.New[int, int](fetchDouble)
+	ctx := oncecache.NewContext(parent, c)
+	require.Equal(t, "parent-value", ctx.Value(k{}))
+	require.Equal(t, c, oncecache.FromContext[int, int](ctx))
+}
+
+// TestFromContext_NestedCachesInnerWins verifies that when ctx has been
+// decorated with two caches of the same K/V type, the most-recently-stored
+// (innermost) cache is returned.
+func TestFromContext_NestedCachesInnerWins(t *testing.T) {
+	t.Parallel()
+	c1 := oncecache.New[int, int](fetchDouble, oncecache.Name("outer"))
+	c2 := oncecache.New[int, int](fetchDouble, oncecache.Name("inner"))
+	ctx := oncecache.NewContext(oncecache.NewContext(context.Background(), c1), c2)
+	got := oncecache.FromContext[int, int](ctx)
+	require.Equal(t, "inner", got.Name())
+}
+
+// TestCache_AsSlogAttribute verifies that a Cache can be passed directly
+// to slog and produces a useful structured representation.
+func TestCache_AsSlogAttribute(t *testing.T) {
+	t.Parallel()
+	buf, log := newBufLogger()
+	c := oncecache.New[int, string](
+		func(_ context.Context, k int) (string, error) { return "v", nil },
+		oncecache.Name("attr-cache"),
+	)
+	_, _ = c.Get(context.Background(), 1)
+	_, _ = c.Get(context.Background(), 2)
+	log.Info("status", "cache", c)
+	out := buf.String()
+	require.Contains(t, out, "attr-cache")
+	require.Contains(t, out, "entries=2")
+	require.Contains(t, out, "key=int")
+	require.Contains(t, out, "val=string")
+}
+
+// TestStress runs random concurrent Get/MaybeSet/Delete/Clear/Has/Keys
+// operations against the cache for a fixed duration. Its job is to
+// surface races, deadlocks, and panics that targeted tests may miss.
+// Run with -race to be useful.
+func TestStress(t *testing.T) {
+	t.Parallel()
+	const goroutines = 32
+	const opsPerGoroutine = 2000
+	const keyspace = 64
+
+	var fetchCalls atomic.Int64
+	c := oncecache.New[int, int](
+		func(_ context.Context, k int) (int, error) {
+			fetchCalls.Add(1)
+			return k * 2, nil
+		},
+		oncecache.OnFill(func(_ context.Context, _, _ int, _ error) {}),
+		oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) {}),
+		oncecache.OnHit(func(_ context.Context, _, _ int, _ error) {}),
+	)
+
+	wg := &sync.WaitGroup{}
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(g)))
+			ctx := context.Background()
+			for i := 0; i < opsPerGoroutine; i++ {
+				key := rng.Intn(keyspace)
+				switch rng.Intn(6) {
+				case 0:
+					_, _ = c.Get(ctx, key)
+				case 1:
+					_ = c.MaybeSet(ctx, key, key*10, nil)
+				case 2:
+					c.Delete(ctx, key)
+				case 3:
+					if rng.Intn(50) == 0 {
+						c.Clear(ctx)
+					}
+				case 4:
+					_ = c.Has(key)
+				case 5:
+					_ = c.Keys()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	t.Logf("fetch invocations: %d (over %d ops, keyspace %d)",
+		fetchCalls.Load(), goroutines*opsPerGoroutine, keyspace)
+}
+
+// TestOnEvent_AllOpsDefault verifies that an empty ops list defaults to
+// delivering all four op kinds, and exercises the OpHit / OpMiss / OpEvict
+// branches of eventOpt.apply.
+func TestOnEvent_AllOpsDefault(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ch := make(chan oncecache.Event[int, int], 16)
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.OnEvent(ch, false), // no ops → all four
+	)
+
+	_, _ = c.Get(ctx, 1) // miss + fill
+	_, _ = c.Get(ctx, 1) // hit
+	c.Delete(ctx, 1)     // evict
+
+	got := make(map[oncecache.Op]int)
+loop:
+	for {
+		select {
+		case ev := <-ch:
+			got[ev.Op]++
+		case <-time.After(50 * time.Millisecond):
+			break loop
+		}
+	}
+	require.Equal(t, 1, got[oncecache.OpMiss])
+	require.Equal(t, 1, got[oncecache.OpFill])
+	require.Equal(t, 1, got[oncecache.OpHit])
+	require.Equal(t, 1, got[oncecache.OpEvict])
+}
+
+// TestLog_DefaultOps verifies that calling Log with an empty ops list
+// logs all four op kinds.
+func TestLog_DefaultOps(t *testing.T) {
+	t.Parallel()
+	buf, log := newBufLogger()
+	c := oncecache.New[int, int](
+		fetchDouble,
+		oncecache.Name("dops"),
+		oncecache.Log(log, slog.LevelInfo), // no ops → all
+	)
+	_, _ = c.Get(context.Background(), 1) // miss + fill
+	_, _ = c.Get(context.Background(), 1) // hit
+	c.Delete(context.Background(), 1)     // evict
+
+	out := buf.String()
+	for _, op := range []string{"miss", "fill", "hit", "evict"} {
+		require.Contains(t, out, "ev.op="+op, "missing op=%s in output", op)
+	}
 }
 
 // BenchmarkGet_Hit measures a single-goroutine steady-state cache hit.

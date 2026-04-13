@@ -117,7 +117,9 @@ var ErrPanic = errors.New("oncecache: panic in FetchFunc")
 // The returned [Cache] is safe for concurrent use by multiple goroutines.
 //
 // Passing a nil fetch is permitted but limits the cache to [Cache.MaybeSet]
-// population: any [Cache.Get] for an unpopulated key will panic.
+// population: any [Cache.Get] for an unpopulated key returns the zero
+// value with an error wrapping [ErrPanic] (the recovered nil-pointer
+// dereference).
 func New[K comparable, V any](fetch FetchFunc[K, V], opts ...Opt) *Cache[K, V] {
 	c := &Cache[K, V]{
 		entries: map[K]*entry[K, V]{},
