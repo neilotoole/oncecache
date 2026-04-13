@@ -394,12 +394,15 @@ func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 // filled, returning true if the value was set. This allows external code to
 // prime the cache or propagate values from another source.
 //
-// If there's already an entry for key — whether it was populated by
-// [Cache.Get], a prior [Cache.MaybeSet], or even if it's still being filled
-// by an in-flight fetch — MaybeSet is a no-op and returns false. The err
-// argument, when non-nil, is stored alongside val just like a fetch error;
-// subsequent [Cache.Get] calls for this key return (val, err) without
-// reinvoking fetch.
+// If there's already a filled entry for key — populated by a prior
+// [Cache.Get] or [Cache.MaybeSet] — MaybeSet does not replace it and
+// returns false. If the entry is still being filled by an in-flight
+// fetch, MaybeSet blocks until that fetch completes (because it shares
+// the entry's [sync.Once]), and then returns false.
+//
+// The err argument, when non-nil, is stored alongside val just like a
+// fetch error; subsequent [Cache.Get] calls for this key return
+// (val, err) without reinvoking fetch.
 //
 // When MaybeSet does populate the entry, it invokes any [OnFill] callbacks
 // synchronously and emits an [OpFill] event via any [OnEvent] channels.
@@ -521,18 +524,21 @@ func (c *Cache[K, V]) GobEncode() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// GobDecode implements [gob.GobDecoder]. Only the cache name and entries are
-// restored from p; the fetch func and callbacks on c are preserved as-is.
-// Any pre-existing entries in c are cleared before decoding; decoded entries
-// are marked as filled, so subsequent [Cache.Get] calls return them directly
-// without invoking fetch.
+// GobDecode implements [gob.GobDecoder]. Only the cache name and entries
+// are restored from p. Any pre-existing entries in c are cleared before
+// decoding; decoded entries are marked as filled, so subsequent
+// [Cache.Get] calls return them directly without invoking fetch.
 //
-// Unlike other methods, GobDecode is safe to call on a zero-value [Cache]
-// (as gob-provided decoding into `var c Cache[K, V]` will do): it
-// initializes the internal map and dispatch functions on demand. The
-// decoded cache will have no fetch func and no callbacks, so further
-// [Cache.Get] for a key not already in the decoded map yields an error
-// wrapping [ErrPanic] (the recovered nil-fetch call).
+// Behavior depends on how c was initialized:
+//   - Decoding into a [Cache] constructed via [New]: the existing fetch
+//     func and callbacks are preserved. [Cache.Get] on a key absent from
+//     the decoded payload triggers the existing fetch func as usual.
+//   - Decoding into a zero-value [Cache] (as `gob.Decode` into
+//     `var c Cache[K, V]` does): the internal map and dispatch functions
+//     are initialized on demand, but the cache has no fetch func and no
+//     callbacks. [Cache.Get] for a key absent from the decoded payload
+//     yields an error wrapping [ErrPanic] (the recovered nil-fetch
+//     dereference).
 //
 // The error type(s) used in entries with non-nil fill errors must be
 // registered with [gob.Register] before encoding/decoding. The package
