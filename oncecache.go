@@ -437,10 +437,11 @@ func (c *Cache[K, V]) MaybeSet(ctx context.Context, key K, val V, err error) (ok
 // Concurrent Get calls for the same unfilled key block until the in-flight
 // fetch completes and then all receive the same (val, err).
 //
-// If fetch panics, the panic is recovered and converted into a fill error
-// wrapping [ErrPanic]; Get returns (zero, that wrapped error) instead of
-// propagating the panic. [OpFill] still fires with the wrapped error. See
-// [FetchFunc] for details.
+// If fetch (or an [OnMiss] callback) panics, the panic is recovered and
+// converted into a fill error wrapping [ErrPanic]; Get returns (zero, that
+// wrapped error) instead of propagating the panic. When an OnMiss callback
+// panics, fetch is skipped. [OpFill] still fires with the wrapped error in
+// either case. See [FetchFunc] and [OnMiss] for details.
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, error) {
 	e := c.getEntry(key)
 	return c.getValueFn(ctx, c, e, key)

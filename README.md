@@ -28,6 +28,8 @@ go get github.com/neilotoole/oncecache
 
 ## Usage
 
+`oncecache` requires Go 1.26 or later.
+
 The basic theory of operation is that a [`oncecache.Cache`](https://pkg.go.dev/github.com/neilotoole/oncecache#Cache) is created with a
 function that returns the value corresponding to a key. When a key is requested
 from the cache, the cache checks if the value is already present. If not, the
