@@ -1438,9 +1438,10 @@ func TestOnHit_ErrorEntry(t *testing.T) {
 	require.Equal(t, int64(1), hits.Load())
 }
 
-// TestOnFill_PanicPropagates verifies that callback panics are NOT
-// recovered (only fetch panics are). The panic propagates to the Get
-// caller, but the entry is still filled, so subsequent Gets succeed.
+// TestOnFill_PanicPropagates verifies that an OnFill panic propagates to
+// the Get caller and is NOT recovered (only FetchFunc and OnMiss panics are
+// recovered into a fill error). The entry is still filled before OnFill
+// runs, so subsequent Gets succeed.
 func TestOnFill_PanicPropagates(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
