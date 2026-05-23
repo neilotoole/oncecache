@@ -1654,6 +1654,20 @@ func TestCache_AsSlogAttribute(t *testing.T) {
 	require.Contains(t, out, "val=string")
 }
 
+// TestName_NilAndZeroValue verifies Cache.Name is safe to call on a nil
+// receiver and on an uninitialized (zero-value) cache, returning "" rather
+// than panicking — the property [Event.LogValue]/[Entry.LogValue] rely on
+// when slog resolves a zero Event/Entry.
+func TestName_NilAndZeroValue(t *testing.T) {
+	t.Parallel()
+
+	var nilCache *oncecache.Cache[int, int]
+	require.Equal(t, "", nilCache.Name(), "nil receiver must yield empty name")
+
+	var zeroCache oncecache.Cache[int, int]
+	require.Equal(t, "", zeroCache.Name(), "zero-value cache must yield empty name")
+}
+
 // TestStress runs random concurrent Get/MaybeSet/Delete/Clear/Has/Keys
 // operations against the cache. Its primary job is to surface races,
 // deadlocks, and panics under -race. A Get or MaybeSet for any key k

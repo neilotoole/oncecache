@@ -28,4 +28,10 @@ jobs:
         version: ${{ env.GOLANGCI_LINT_VERSION }}
 
     - name: Test
-      run: go test -v ./...
+      run: go test -race -shuffle=on -count=1 -cover -v ./...
+
+    - name: Benchmarks (smoke)
+      # Run every benchmark once under -race to verify they execute (and the
+      # parallel ones stay race-free). Not a perf measurement: timings on
+      # shared CI runners are too noisy to be meaningful.
+      run: go test -race -run='^$' -bench=. -benchtime=1x ./...
