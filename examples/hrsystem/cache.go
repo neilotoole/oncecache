@@ -72,7 +72,7 @@ func (c *HRCache) GetDepartment(ctx context.Context, deptName string) (*Departme
 	if err == nil {
 		c.log.Info("GetDepartment", "dept", dept)
 	} else {
-		c.log.Error("GetDepartment", "dept", dept.Name, "error", err.Error())
+		c.log.Error("GetDepartment", "dept", deptName, "error", err)
 	}
 
 	return dept, err
