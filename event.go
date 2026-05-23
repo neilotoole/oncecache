@@ -256,9 +256,9 @@ const (
 	// OpMiss indicates a cache miss: [Cache.Get] found no entry for the
 	// key and is about to invoke [FetchFunc]. OpMiss fires once per entry
 	// lifetime and is immediately followed by [OpFill] — including when
-	// [FetchFunc] panics, in which case the panic is recovered into an
-	// error wrapping [ErrPanic] and OpFill carries that error. See
-	// [FetchFunc].
+	// [FetchFunc] or an [OnMiss] callback panics, in which case the panic
+	// is recovered into an error wrapping [ErrPanic] and OpFill carries
+	// that error. See [FetchFunc] and [OnMiss].
 	OpMiss Op = 2
 
 	// OpFill indicates that a cache entry has been populated. It is

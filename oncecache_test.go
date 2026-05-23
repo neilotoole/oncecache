@@ -444,10 +444,6 @@ func TestOnEventChan(t *testing.T) {
 						empCache.Delete(ctx, emp.ID)
 					}
 				default:
-					if event.Op.IsZero() {
-						// This is the final zero event, indicating that the channel is closed.
-						return
-					}
 					panic(fmt.Sprintf("unexpected action: %v", event.Op))
 				}
 				actionCh <- event.Op

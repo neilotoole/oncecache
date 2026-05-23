@@ -136,8 +136,8 @@ entry `(key, zero-value, err)` is still a fully-populated entry, and a
 subsequent `Get` for the same key returns that same error without reinvoking
 fetch, until the entry is explicitly evicted.
 
-If the fetch function **panics**, `oncecache` recovers the panic and stores it
-as an error wrapping the exported
+If the fetch function (or an `OnMiss` callback) **panics**, `oncecache`
+recovers the panic and stores it as an error wrapping the exported
 [`ErrPanic`](https://pkg.go.dev/github.com/neilotoole/oncecache#ErrPanic)
 sentinel. `Get` returns that wrapped error — the panic is *not* propagated
 to the caller. `OnFill` callbacks fire normally with the wrapped error.

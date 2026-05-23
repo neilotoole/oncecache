@@ -451,13 +451,16 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, error) {
 // caller's once.Do completes. Holds c.mu only for the map lookup/insert.
 func (c *Cache[K, V]) getEntry(key K) *entry[K, V] {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.entries[key]
-	if ok {
+	if e, ok := c.entries[key]; ok {
+		// Hit (the hot path): explicit unlock, no defer overhead.
+		c.mu.Unlock()
 		return e
 	}
 
-	e = &entry[K, V]{}
+	// Miss: defer the unlock so a panic on the nil-map write — reachable
+	// only on an unsupported zero-value Cache — cannot leak c.mu.
+	defer c.mu.Unlock()
+	e := &entry[K, V]{}
 	c.entries[key] = e
 	return e
 }
