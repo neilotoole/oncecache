@@ -3,7 +3,7 @@ module github.com/neilotoole/oncecache
 go 1.26
 
 require (
-	github.com/neilotoole/slogt v1.1.0
+	github.com/neilotoole/slogt/v2 v2.0.0
 	github.com/stretchr/testify v1.11.1
 )
 

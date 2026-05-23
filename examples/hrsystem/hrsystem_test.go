@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/neilotoole/slogt"
+	"github.com/neilotoole/slogt/v2"
 
 	"github.com/neilotoole/oncecache/examples/hrsystem"
 )
