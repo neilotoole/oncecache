@@ -37,7 +37,7 @@ returns it. Subsequent requests for the same key return the cached value.
 Here's a trivial example that caches computed fibonacci numbers:
 
 ```go
-func ExampleFibonacci() {
+func ExampleCache_Get() {
 	// Ignore error handling for brevity.
 	ctx := context.Background()
 	c := oncecache.New[int, int](calcFibonacci)
