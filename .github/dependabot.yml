@@ -1,0 +1,31 @@
+# Dependabot configuration. See
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  # Go module dependencies (e.g. testify, slogt). These are test-only deps;
+  # the library itself is dependency-free.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Batch routine minor/patch bumps into a single PR; major (potentially
+      # breaking) updates still open as separate, individually reviewable PRs.
+      go-modules:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the workflows (actions/checkout, actions/setup-go,
+  # golangci/golangci-lint-action, codecov/codecov-action).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        update-types:
+          - minor
+          - patch
