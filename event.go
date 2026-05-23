@@ -230,6 +230,12 @@ func OnHit[K comparable, V any](fn func(ctx context.Context, key K, val V, err e
 // OnMiss callbacks run synchronously; the triggering [Cache.Get] blocks
 // until they return. Prefer [OnEvent] for long-running work.
 //
+// If an OnMiss callback panics, the panic is recovered and becomes the
+// entry's fill error (wrapping [ErrPanic]), exactly as a [FetchFunc] panic
+// would; fetch is skipped, [OpFill] still fires with the wrapped error, and
+// the triggering [Cache.Get] returns (zero, wrapped error) rather than
+// propagating the panic.
+//
 // OnMiss is not emitted by [Cache.MaybeSet], since MaybeSet is not a
 // [Cache.Get] miss path.
 func OnMiss[K comparable, V any](fn func(ctx context.Context, key K, val V, err error)) Opt {
@@ -248,11 +254,12 @@ const (
 	OpHit Op = 1
 
 	// OpMiss indicates a cache miss: [Cache.Get] found no entry for the
-	// key and is about to invoke [FetchFunc]. OpMiss fires once per entry
-	// lifetime and is immediately followed by [OpFill] — including when
-	// [FetchFunc] panics, in which case the panic is recovered into an
-	// error wrapping [ErrPanic] and OpFill carries that error. See
-	// [FetchFunc].
+	// key and is about to fill it, normally by invoking [FetchFunc]. OpMiss
+	// fires once per entry lifetime and is immediately followed by [OpFill]
+	// — including when [FetchFunc] or an [OnMiss] callback panics, in which
+	// case the panic is recovered into an error wrapping [ErrPanic] and
+	// OpFill carries that error (when an OnMiss callback panics, fetch is
+	// skipped). See [FetchFunc] and [OnMiss].
 	OpMiss Op = 2
 
 	// OpFill indicates that a cache entry has been populated. It is

@@ -93,13 +93,14 @@ import (
 // invariant: a miss is followed by a fill — successful or panic-wrapped.
 type FetchFunc[K comparable, V any] func(ctx context.Context, key K) (val V, err error)
 
-// ErrPanic is the sentinel wrapped in the fill error when a [FetchFunc]
-// panics. Use [errors.Is] to detect it:
+// ErrPanic is the sentinel wrapped in the fill error when a [FetchFunc] (or
+// an [OnMiss] callback) panics during a [Cache.Get] fill. Use [errors.Is] to
+// detect it:
 //
 //	if _, err := c.Get(ctx, key); errors.Is(err, oncecache.ErrPanic) {
-//		// ... handle panic-during-fetch
+//		// ... handle panic-during-fill
 //	}
-var ErrPanic = errors.New("oncecache: panic in FetchFunc")
+var ErrPanic = errors.New("oncecache: panic during fill")
 
 // New constructs a [Cache] parameterized over key type K and value type V. The
 // fetch func is invoked on-demand by [Cache.Get] to populate an entry for a
@@ -256,8 +257,18 @@ type Cache[K comparable, V any] struct {
 // is set via the [Name] opt to [New]; otherwise a random name of the form
 // "cache-XXXXXXXX" (eight hex digits) is generated. Safe for concurrent
 // use, including with [Cache.GobDecode].
+//
+// Name returns "" for a nil receiver or an uninitialized (zero-value) Cache,
+// so it is safe to call on the zero [Event]/[Entry] values that [slog] may
+// resolve (see [Event.LogValue]).
 func (c *Cache[K, V]) Name() string {
-	return *c.name.Load()
+	if c == nil {
+		return ""
+	}
+	if p := c.name.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // Len returns the number of entries in the cache, including entries that
@@ -426,10 +437,11 @@ func (c *Cache[K, V]) MaybeSet(ctx context.Context, key K, val V, err error) (ok
 // Concurrent Get calls for the same unfilled key block until the in-flight
 // fetch completes and then all receive the same (val, err).
 //
-// If fetch panics, the panic is recovered and converted into a fill error
-// wrapping [ErrPanic]; Get returns (zero, that wrapped error) instead of
-// propagating the panic. [OpFill] still fires with the wrapped error. See
-// [FetchFunc] for details.
+// If fetch (or an [OnMiss] callback) panics, the panic is recovered and
+// converted into a fill error wrapping [ErrPanic]; Get returns (zero, that
+// wrapped error) instead of propagating the panic. When an OnMiss callback
+// panics, fetch is skipped. [OpFill] still fires with the wrapped error in
+// either case. See [FetchFunc] and [OnMiss] for details.
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, error) {
 	e := c.getEntry(key)
 	return c.getValueFn(ctx, c, e, key)
@@ -440,15 +452,17 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, error) {
 // caller's once.Do completes. Holds c.mu only for the map lookup/insert.
 func (c *Cache[K, V]) getEntry(key K) *entry[K, V] {
 	c.mu.Lock()
-	e, ok := c.entries[key]
-	if ok {
+	if e, ok := c.entries[key]; ok {
+		// Hit (the hot path): explicit unlock, no defer overhead.
 		c.mu.Unlock()
 		return e
 	}
 
-	e = &entry[K, V]{}
+	// Miss: defer the unlock so a panic on the nil-map write — reachable
+	// only on an unsupported zero-value Cache — cannot leak c.mu.
+	defer c.mu.Unlock()
+	e := &entry[K, V]{}
 	c.entries[key] = e
-	c.mu.Unlock()
 	return e
 }
 
@@ -652,8 +666,11 @@ func registerFillPanicErrorOnGob() {
 // returning the wrapped error is more useful than propagating the panic to
 // the caller, and it avoids leaving the entry in a half-initialized state.
 //
-// Callback panics (OnMiss, OnFill, OnHit, OnEvict) are deliberately not
-// recovered here; they propagate to the triggering caller.
+// Panics in OnFill, OnHit, and OnEvict callbacks are deliberately not
+// recovered; they propagate to the triggering caller. OnMiss is the
+// exception: because it runs inside the entry's sync.Once before fetch, an
+// unrecovered panic there would consume the Once and strand the entry
+// unfilled, so callOnMiss recovers it into a fill error instead.
 func callFetch[K comparable, V any](ctx context.Context, c *Cache[K, V], key K) (val V, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -663,6 +680,29 @@ func callFetch[K comparable, V any](ctx context.Context, c *Cache[K, V], key K) 
 		}
 	}()
 	return c.fetch(ctx, key)
+}
+
+// callOnMiss invokes the OnMiss callbacks, recovering any panic and
+// converting it into an error wrapping [ErrPanic] (mirroring [callFetch]).
+// A non-nil return means an OnMiss callback panicked; the caller stores that
+// error as the entry's fill result and skips fetch, so the entry ends up
+// filled with a panic-wrapped error rather than stranded unfilled. The
+// callbacks receive the zero value and a nil error, since the entry is not
+// yet populated at miss time.
+func callOnMiss[K comparable, V any](ctx context.Context, c *Cache[K, V], key K) (err error) {
+	if len(c.onMiss) == 0 {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = &fillPanicError{recovered: fmt.Sprintf("%v", r)}
+		}
+	}()
+	var zero V
+	for _, fn := range c.onMiss {
+		fn(ctx, key, zero, nil)
+	}
+	return nil
 }
 
 // maybeSetValueSlow is the MaybeSet core used when OnFill callbacks are
@@ -705,16 +745,21 @@ func maybeSetValueFast[K comparable, V any](
 // all inside the entry's sync.Once. On hit it fires OnHit outside the Once
 // (safe: the Once's completion synchronizes the val/err writes for later
 // readers).
+//
+// A panic in an OnMiss callback is recovered and becomes the entry's fill
+// error (wrapping [ErrPanic]), exactly as a fetch panic would; fetch is
+// skipped in that case but [OnFill] still fires with the wrapped error.
 func getValueSlow[K comparable, V any](ctx context.Context, c *Cache[K, V], e *entry[K, V], key K) (V, error) {
 	var miss bool
 	e.once.Do(func() {
 		miss = true
 		cbCtx := NewContext(ctx, c)
-		for _, fn := range c.onMiss {
-			fn(cbCtx, key, e.val, e.err)
-		}
 
-		e.val, e.err = callFetch(cbCtx, c, key)
+		if err := callOnMiss(cbCtx, c, key); err != nil {
+			e.err = err // e.val stays the zero value; fetch is skipped.
+		} else {
+			e.val, e.err = callFetch(cbCtx, c, key)
+		}
 		e.filled.Store(true)
 
 		for _, fn := range c.onFill {
