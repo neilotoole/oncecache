@@ -230,6 +230,12 @@ func OnHit[K comparable, V any](fn func(ctx context.Context, key K, val V, err e
 // OnMiss callbacks run synchronously; the triggering [Cache.Get] blocks
 // until they return. Prefer [OnEvent] for long-running work.
 //
+// If an OnMiss callback panics, the panic is recovered and becomes the
+// entry's fill error (wrapping [ErrPanic]), exactly as a [FetchFunc] panic
+// would; fetch is skipped, [OpFill] still fires with the wrapped error, and
+// the triggering [Cache.Get] returns (zero, wrapped error) rather than
+// propagating the panic.
+//
 // OnMiss is not emitted by [Cache.MaybeSet], since MaybeSet is not a
 // [Cache.Get] miss path.
 func OnMiss[K comparable, V any](fn func(ctx context.Context, key K, val V, err error)) Opt {

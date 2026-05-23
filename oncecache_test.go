@@ -369,7 +369,13 @@ func TestCallbacks(t *testing.T) {
 func TestOnEventChan(t *testing.T) {
 	log := slogt.New(t)
 	ctx, cancelFn := context.WithCancel(context.Background())
-	defer cancelFn()
+	var wg sync.WaitGroup
+	// Cancel the consumer goroutine and wait for it to exit before the test
+	// returns, so it cannot log a (zero-value) event after completion.
+	defer func() {
+		cancelFn()
+		wg.Wait()
+	}()
 
 	db := loadHRDatabase(t)
 
@@ -380,7 +386,6 @@ func TestOnEventChan(t *testing.T) {
 	)
 
 	orgCacheCh := make(chan oncecache.Event[string, *hrsystem.Org], 10)
-	defer close(orgCacheCh)
 
 	orgCache = oncecache.New[string, *hrsystem.Org](
 		db.GetOrg,
@@ -390,7 +395,6 @@ func TestOnEventChan(t *testing.T) {
 	)
 
 	deptCacheCh := make(chan oncecache.Event[string, *hrsystem.Department], 10)
-	defer close(deptCacheCh)
 
 	deptCache = oncecache.New[string, *hrsystem.Department](
 		db.GetDepartment,
@@ -403,7 +407,9 @@ func TestOnEventChan(t *testing.T) {
 
 	// We use actionCh to signal that an event has been handled.
 	actionCh := make(chan oncecache.Op, 100)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		log2 := log.With("layer", "event")
 		for {
 			select {
@@ -906,6 +912,52 @@ func TestFetchPanic(t *testing.T) {
 	require.Zero(t, v)
 	require.ErrorIs(t, err, oncecache.ErrPanic)
 	require.Equal(t, int64(1), fetchCalls.Load())
+}
+
+// TestOnMissPanic verifies that a panic in an OnMiss callback is recovered
+// into the entry's fill error (wrapping ErrPanic) rather than propagating or
+// stranding the entry unfilled: fetch is skipped, OnFill still fires with the
+// wrapped error, subsequent Gets return the same error, and the entry is
+// properly filled (so Delete fires OnEvict).
+func TestOnMissPanic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var fetchCalls, fillCalls, evictCalls atomic.Int64
+	c := oncecache.New[int, int](
+		func(_ context.Context, _ int) (int, error) {
+			fetchCalls.Add(1)
+			return 42, nil
+		},
+		oncecache.OnMiss(func(_ context.Context, _, _ int, _ error) {
+			panic("miss-boom")
+		}),
+		oncecache.OnFill(func(_ context.Context, _, _ int, _ error) {
+			fillCalls.Add(1)
+		}),
+		oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) {
+			evictCalls.Add(1)
+		}),
+	)
+
+	// The triggering Get returns a wrapped error rather than propagating the panic.
+	v, err := c.Get(ctx, 1)
+	require.Zero(t, v)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+	require.Contains(t, err.Error(), "miss-boom")
+	require.Equal(t, int64(0), fetchCalls.Load(), "fetch must be skipped when OnMiss panics")
+	require.Equal(t, int64(1), fillCalls.Load(), "OpFill must still fire with the wrapped error")
+
+	// Subsequent Get returns the same wrapped error; the entry is not a zombie.
+	v, err = c.Get(ctx, 1)
+	require.Zero(t, v)
+	require.ErrorIs(t, err, oncecache.ErrPanic)
+	require.Equal(t, int64(0), fetchCalls.Load())
+
+	// The entry is properly filled, so Delete fires OnEvict.
+	c.Delete(ctx, 1)
+	require.Equal(t, int64(1), evictCalls.Load(),
+		"Delete must fire OnEvict for the filled (panic-errored) entry")
 }
 
 // TestGob_Empty verifies gob round-trip of an empty cache preserves the name.
