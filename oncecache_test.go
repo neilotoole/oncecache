@@ -1316,7 +1316,6 @@ func TestConcurrentMaybeSet(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
-		i := i
 		go func() {
 			defer wg.Done()
 			if c.MaybeSet(context.Background(), 7, i, nil) {
