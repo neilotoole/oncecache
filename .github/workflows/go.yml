@@ -28,7 +28,17 @@ jobs:
         version: ${{ env.GOLANGCI_LINT_VERSION }}
 
     - name: Test
-      run: go test -race -shuffle=on -count=1 -cover -v ./...
+      run: go test -race -shuffle=on -count=1 -coverprofile=coverage.out -covermode=atomic -v ./...
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./coverage.out
+        slug: neilotoole/oncecache
+        # Don't fail the build on a Codecov upload hiccup (or before the
+        # CODECOV_TOKEN secret is configured).
+        fail_ci_if_error: false
 
     - name: Benchmarks (smoke)
       # Run every benchmark once under -race to verify they execute (and the

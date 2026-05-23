@@ -1,0 +1,15 @@
+# Codecov configuration. See https://docs.codecov.com/docs/codecov-yaml
+coverage:
+  status:
+    # Report coverage changes but never fail the PR check on a dip.
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# The examples module is illustrative; exclude it from the coverage metric
+# so the badge reflects the library code.
+ignore:
+  - "examples"
