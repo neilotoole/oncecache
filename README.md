@@ -18,6 +18,7 @@ corresponding to a key is expensive to compute or fetch, the value is likely to 
 multiple times, and is not expected to change. The cache is not intended for general purpose
 caching where values are frequently updated.
 
+`oncecache` was created to support the [`sq`](https://github.com/neilotoole/sq) data-wrangling CLI.
 
 ## Install
 
@@ -27,9 +28,11 @@ Add to your `go.mod` via `go get`:
 go get github.com/neilotoole/oncecache
 ```
 
-## Usage
+> [!NOTE]
+> `oncecache` requires Go 1.26 or later.
 
-`oncecache` requires Go 1.26 or later.
+
+## Usage
 
 The basic theory of operation is that a [`oncecache.Cache`](https://pkg.go.dev/github.com/neilotoole/oncecache#Cache) is created with a
 function that returns the value corresponding to a key. When a key is requested
