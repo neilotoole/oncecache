@@ -4,6 +4,7 @@
 [![Go Report Card](https://goreportcard.com/badge/neilotoole/oncecache)](https://goreportcard.com/report/neilotoole/oncecache)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/neilotoole/oncecache/blob/master/LICENSE)
 ![Workflow](https://github.com/neilotoole/oncecache/actions/workflows/go.yml/badge.svg)
+[![codecov](https://codecov.io/gh/neilotoole/oncecache/branch/master/graph/badge.svg)](https://codecov.io/gh/neilotoole/oncecache)
 
 `oncecache` is a strongly-typed, concurrency-safe, context-aware,
 dependency-free, in-memory, on-demand Golang object cache, focused on write-once,
