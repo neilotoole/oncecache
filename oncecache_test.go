@@ -919,7 +919,11 @@ func TestOnMissPanic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
+	// OnFill/OnEvict callbacks fire synchronously on the calling goroutine,
+	// so capturing their args in plain vars (read after the call) is race-free.
 	var fetchCalls, fillCalls, evictCalls atomic.Int64
+	var fillVal, evictVal int
+	var fillErr, evictErr error
 	c := oncecache.New[int, int](
 		func(_ context.Context, _ int) (int, error) {
 			fetchCalls.Add(1)
@@ -928,11 +932,13 @@ func TestOnMissPanic(t *testing.T) {
 		oncecache.OnMiss(func(_ context.Context, _, _ int, _ error) {
 			panic("miss-boom")
 		}),
-		oncecache.OnFill(func(_ context.Context, _, _ int, _ error) {
+		oncecache.OnFill(func(_ context.Context, _, val int, err error) {
 			fillCalls.Add(1)
+			fillVal, fillErr = val, err
 		}),
-		oncecache.OnEvict(func(_ context.Context, _, _ int, _ error) {
+		oncecache.OnEvict(func(_ context.Context, _, val int, err error) {
 			evictCalls.Add(1)
+			evictVal, evictErr = val, err
 		}),
 	)
 
@@ -942,7 +948,11 @@ func TestOnMissPanic(t *testing.T) {
 	require.ErrorIs(t, err, oncecache.ErrPanic)
 	require.Contains(t, err.Error(), "miss-boom")
 	require.Equal(t, int64(0), fetchCalls.Load(), "fetch must be skipped when OnMiss panics")
-	require.Equal(t, int64(1), fillCalls.Load(), "OpFill must still fire with the wrapped error")
+
+	// OnFill must fire once and receive the zero value plus the wrapped error.
+	require.Equal(t, int64(1), fillCalls.Load(), "OpFill must still fire")
+	require.Zero(t, fillVal, "OnFill must receive the zero value")
+	require.ErrorIs(t, fillErr, oncecache.ErrPanic, "OnFill must receive the wrapped ErrPanic")
 
 	// Subsequent Get returns the same wrapped error; the entry is not a zombie.
 	v, err = c.Get(ctx, 1)
@@ -950,10 +960,12 @@ func TestOnMissPanic(t *testing.T) {
 	require.ErrorIs(t, err, oncecache.ErrPanic)
 	require.Equal(t, int64(0), fetchCalls.Load())
 
-	// The entry is properly filled, so Delete fires OnEvict.
+	// The entry is properly filled, so Delete fires OnEvict with the same wrapped error.
 	c.Delete(ctx, 1)
 	require.Equal(t, int64(1), evictCalls.Load(),
 		"Delete must fire OnEvict for the filled (panic-errored) entry")
+	require.Zero(t, evictVal, "OnEvict must receive the zero value")
+	require.ErrorIs(t, evictErr, oncecache.ErrPanic, "OnEvict must receive the wrapped ErrPanic")
 }
 
 // TestGob_Empty verifies gob round-trip of an empty cache preserves the name.
